@@ -1,1 +1,8 @@
 .note/
+
+# Rust build artifacts
+/target/
+
+# Editor
+.vscode/
+
