@@ -3,11 +3,13 @@ name = "bmdb"
 version = "0.1.0"
 edition = "2024"
 
+# The default test harness pulls in std, which is unavailable on bare metal.
 [[bin]]
 name = "bmdb"
 test = false
 bench = false
 
+# Unwinding needs runtime support; abort keeps panic handling self-contained.
 [profile.dev]
 panic = "abort"
 

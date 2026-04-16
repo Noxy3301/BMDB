@@ -1,3 +1,5 @@
+# Pin toolchain to nightly for build-std and json-target-spec.
+
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "llvm-tools-preview"]
