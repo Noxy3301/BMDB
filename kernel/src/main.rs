@@ -8,6 +8,7 @@ mod gdt;
 mod interrupts;
 mod memory;
 
+use bmdb_nvme::BLOCK_SIZE;
 use bmdb_serial::serial_println;
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
@@ -36,7 +37,20 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("PCI devices on bus 0:");
     bmdb_pci::scan_bus(0);
 
-    bmdb_nvme::init(phys_mem_offset, &mapper);
+    let mut nvme = bmdb_nvme::init(phys_mem_offset, &mapper).expect("NVMe init failed");
+
+    // Confirm end-to-end DMA by writing a recognizable pattern to LBA 0 and
+    // reading it back. This is temporary and will be replaced by the real
+    // storage layer.
+    let mut pattern = [0u8; BLOCK_SIZE];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = ((i * 7 + 11) & 0xFF) as u8;
+    }
+    nvme.write_block(0, &pattern).expect("write LBA 0 failed");
+    let mut readback = [0u8; BLOCK_SIZE];
+    nvme.read_block(0, &mut readback).expect("read LBA 0 failed");
+    assert_eq!(pattern, readback);
+    serial_println!("NVMe: LBA 0 round trip OK (512 bytes verified)");
 
     serial_println!("It did not crash!");
     hlt_loop();

@@ -1,5 +1,5 @@
-//! NVMe controller initialization, admin/I/O queue management, and a
-//! write-read round trip to verify end-to-end DMA.
+//! NVMe controller initialization, admin/I/O queue management, and 512-byte
+//! block I/O on namespace 1.
 
 #![no_std]
 
@@ -20,6 +20,8 @@ const REG_ACQ: usize = 0x30;
 const ADMIN_QD: u16 = 64;
 const IO_QD: u16 = 64;
 const IO_QID: u16 = 1;
+
+pub const BLOCK_SIZE: usize = 512;
 
 // Admin Submission Queue Entry, exactly 64 bytes.
 #[repr(C)]
@@ -85,6 +87,8 @@ static mut ADMIN_CQ: Page4K<[CqEntry; ADMIN_QD as usize]> =
 static mut IO_SQ: Page4K<[SqEntry; IO_QD as usize]> = Page4K([EMPTY_SQE; IO_QD as usize]);
 static mut IO_CQ: Page4K<[CqEntry; IO_QD as usize]> = Page4K([EMPTY_CQE; IO_QD as usize]);
 static mut IDENTIFY_BUF: Page4K<[u8; 4096]> = Page4K([0; 4096]);
+// Bounce buffer for data transfers. A single 4K page fits one PRP entry with
+// no chaining, so callers are limited to one block per call for now.
 static mut DATA_BUF: Page4K<[u8; 4096]> = Page4K([0; 4096]);
 
 #[inline]
@@ -116,11 +120,19 @@ struct Queue {
     phase: u16,
 }
 
-struct Controller {
+/// A live NVMe controller with one I/O queue pair. Not Sync: the static bounce
+/// buffer and queue memory make this single-consumer by construction.
+pub struct Controller {
     base: *mut u8,
     admin: Queue,
-    io: Option<Queue>,
+    io: Queue,
+    data_buf_phys: u64,
 }
+
+/// NVMe completion status. Non-zero indicates the controller rejected the
+/// command; the lower bits carry the status code per NVMe Section 4.5.
+#[derive(Debug, Clone, Copy)]
+pub struct IoError(pub u16);
 
 /// Submit a command and spin-poll for its completion. Free function so the
 /// caller can split-borrow `base` and the queue out of `Controller`.
@@ -156,13 +168,11 @@ fn status_code(cqe: &CqEntry) -> u16 {
     (cqe.status >> 1) & 0x7FF
 }
 
-/// Discover the NVMe controller, bring it up, create one I/O queue pair, and
-/// round-trip a block to confirm DMA works end-to-end.
-pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
-    let Some(addr) = pci::find_device(0x01, 0x08) else {
-        serial_println!("NVMe: no controller found");
-        return;
-    };
+/// Discover the NVMe controller, bring it up, and create one I/O queue pair.
+/// Returns a handle usable for block I/O, or `None` if no controller is
+/// present or initialization fails.
+pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) -> Option<Controller> {
+    let addr = pci::find_device(0x01, 0x08)?;
     serial_println!(
         "NVMe: found at {:02x}:{:02x}.{}",
         addr.bus,
@@ -205,7 +215,7 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
         }
         if csts & 2 != 0 {
             serial_println!("NVMe: fatal status CSTS = {:#x}", csts);
-            return;
+            return None;
         }
         core::hint::spin_loop();
     }
@@ -214,19 +224,15 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
     let dstrd = ((cap >> 32) >> 16) as usize & 0xF;
     let stride = 4 << dstrd;
 
-    let mut ctrl = Controller {
-        base,
-        admin: Queue {
-            sq: &raw mut ADMIN_SQ as *mut SqEntry,
-            cq: &raw const ADMIN_CQ as *const CqEntry,
-            qd: ADMIN_QD,
-            sq_doorbell: 0x1000,
-            cq_doorbell: 0x1000 + stride,
-            tail: 0,
-            head: 0,
-            phase: 1,
-        },
-        io: None,
+    let mut admin = Queue {
+        sq: &raw mut ADMIN_SQ as *mut SqEntry,
+        cq: &raw const ADMIN_CQ as *const CqEntry,
+        qd: ADMIN_QD,
+        sq_doorbell: 0x1000,
+        cq_doorbell: 0x1000 + stride,
+        tail: 0,
+        head: 0,
+        phase: 1,
     };
 
     // Identify Controller (CNS = 0x01).
@@ -234,10 +240,10 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
     cmd.cdw0 = 0x06;
     cmd.prp1 = id_phys;
     cmd.cdw10 = 0x01;
-    let cqe = submit(ctrl.base, &mut ctrl.admin, cmd);
+    let cqe = submit(base, &mut admin, cmd);
     if status_code(&cqe) != 0 {
         serial_println!("NVMe: Identify failed, status = {:#x}", cqe.status);
-        return;
+        return None;
     }
     unsafe {
         let buf = &(*(&raw const IDENTIFY_BUF)).0;
@@ -252,10 +258,10 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
     cmd.prp1 = iocq_phys;
     cmd.cdw10 = (((IO_QD - 1) as u32) << 16) | (IO_QID as u32);
     cmd.cdw11 = 1; // PC=1 (physically contiguous), IEN=0
-    let cqe = submit(ctrl.base, &mut ctrl.admin, cmd);
+    let cqe = submit(base, &mut admin, cmd);
     if status_code(&cqe) != 0 {
         serial_println!("NVMe: Create I/O CQ failed, status = {:#x}", cqe.status);
-        return;
+        return None;
     }
 
     // Create I/O Submission Queue (opcode 0x01).
@@ -264,14 +270,14 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
     cmd.prp1 = iosq_phys;
     cmd.cdw10 = (((IO_QD - 1) as u32) << 16) | (IO_QID as u32);
     cmd.cdw11 = ((IO_QID as u32) << 16) | 1; // CQID in high half, PC=1
-    let cqe = submit(ctrl.base, &mut ctrl.admin, cmd);
+    let cqe = submit(base, &mut admin, cmd);
     if status_code(&cqe) != 0 {
         serial_println!("NVMe: Create I/O SQ failed, status = {:#x}", cqe.status);
-        return;
+        return None;
     }
     serial_println!("NVMe: I/O queue pair {} ready", IO_QID);
 
-    ctrl.io = Some(Queue {
+    let io = Queue {
         sq: &raw mut IO_SQ as *mut SqEntry,
         cq: &raw const IO_CQ as *const CqEntry,
         qd: IO_QD,
@@ -280,53 +286,62 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
         tail: 0,
         head: 0,
         phase: 1,
-    });
-
-    // Fill DATA_BUF with a recognizable pattern, write it to LBA 0.
-    unsafe {
-        let buf = &mut (*(&raw mut DATA_BUF)).0;
-        for (i, b) in buf.iter_mut().take(512).enumerate() {
-            *b = ((i * 7 + 11) & 0xFF) as u8;
-        }
-    }
-
-    let mut cmd = EMPTY_SQE;
-    cmd.cdw0 = 0x01; // I/O Write
-    cmd.nsid = 1;
-    cmd.prp1 = data_phys;
-    // CDW10/11 = starting LBA (0), CDW12 = (NLB - 1) = 0 means 1 block.
-    let cqe = submit(ctrl.base, ctrl.io.as_mut().unwrap(), cmd);
-    if status_code(&cqe) != 0 {
-        serial_println!("NVMe: Write failed, status = {:#x}", cqe.status);
-        return;
-    }
-
-    // Zero the buffer to make sure the read actually repopulates it.
-    unsafe {
-        let buf = &mut (*(&raw mut DATA_BUF)).0;
-        for b in buf.iter_mut().take(512) {
-            *b = 0;
-        }
-    }
-
-    let mut cmd = EMPTY_SQE;
-    cmd.cdw0 = 0x02; // I/O Read
-    cmd.nsid = 1;
-    cmd.prp1 = data_phys;
-    let cqe = submit(ctrl.base, ctrl.io.as_mut().unwrap(), cmd);
-    if status_code(&cqe) != 0 {
-        serial_println!("NVMe: Read failed, status = {:#x}", cqe.status);
-        return;
-    }
-
-    let ok = unsafe {
-        let buf = &(*(&raw const DATA_BUF)).0;
-        (0..512).all(|i| buf[i] == ((i * 7 + 11) & 0xFF) as u8)
     };
-    if ok {
-        serial_println!("NVMe: LBA 0 write/read round trip OK (512 bytes verified)");
-    } else {
-        serial_println!("NVMe: LBA 0 round trip MISMATCH");
+
+    Some(Controller {
+        base,
+        admin,
+        io,
+        data_buf_phys: data_phys,
+    })
+}
+
+impl Controller {
+    /// Read one 512-byte block from namespace 1 into `out`.
+    pub fn read_block(&mut self, lba: u64, out: &mut [u8; BLOCK_SIZE]) -> Result<(), IoError> {
+        let mut cmd = EMPTY_SQE;
+        cmd.cdw0 = 0x02; // I/O Read
+        cmd.nsid = 1;
+        cmd.prp1 = self.data_buf_phys;
+        cmd.cdw10 = lba as u32;
+        cmd.cdw11 = (lba >> 32) as u32;
+        // cdw12 NLB field is zero-based; 0 transfers 1 block.
+        let cqe = submit(self.base, &mut self.io, cmd);
+        if status_code(&cqe) != 0 {
+            return Err(IoError(cqe.status));
+        }
+        unsafe {
+            let buf = &(*(&raw const DATA_BUF)).0;
+            out.copy_from_slice(&buf[..BLOCK_SIZE]);
+        }
+        Ok(())
+    }
+
+    /// Write one 512-byte block from `data` to namespace 1 at `lba`.
+    pub fn write_block(&mut self, lba: u64, data: &[u8; BLOCK_SIZE]) -> Result<(), IoError> {
+        unsafe {
+            let buf = &mut (*(&raw mut DATA_BUF)).0;
+            buf[..BLOCK_SIZE].copy_from_slice(data);
+        }
+        let mut cmd = EMPTY_SQE;
+        cmd.cdw0 = 0x01; // I/O Write
+        cmd.nsid = 1;
+        cmd.prp1 = self.data_buf_phys;
+        cmd.cdw10 = lba as u32;
+        cmd.cdw11 = (lba >> 32) as u32;
+        let cqe = submit(self.base, &mut self.io, cmd);
+        if status_code(&cqe) != 0 {
+            return Err(IoError(cqe.status));
+        }
+        Ok(())
+    }
+
+    // Silence dead-code warnings for the admin queue once it's no longer used
+    // after init. Keeping it on the handle lets us add admin commands later
+    // (Create Namespace, Get Log Page, etc.) without re-threading state.
+    #[allow(dead_code)]
+    fn admin(&mut self) -> &mut Queue {
+        &mut self.admin
     }
 }
 
