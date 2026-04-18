@@ -6,3 +6,7 @@ build-std-features = ["compiler-builtins-mem"]
 
 [build]
 target = "x86_64-bmdb.json"
+
+[target.'cfg(target_os = "none")']
+# bootimage post-processes the kernel ELF into a bootable disk image and launches QEMU.
+runner = "bootimage runner"
