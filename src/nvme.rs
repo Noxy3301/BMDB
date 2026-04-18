@@ -1,22 +1,24 @@
-//! NVMe controller initialization and Identify Controller command.
+//! NVMe controller initialization, admin/I/O queue management, and a
+//! write-read round trip to verify end-to-end DMA.
 
 use crate::{pci, serial_println};
 use core::ptr;
 use x86_64::{VirtAddr, structures::paging::Translate};
 
 // Controller register offsets (NVMe spec Section 3.1).
-const REG_CAP: usize = 0x00; // Controller Capabilities (64-bit)
-const REG_VS: usize = 0x08; // Version (32-bit)
-const REG_CC: usize = 0x14; // Controller Configuration (32-bit)
-const REG_CSTS: usize = 0x1C; // Controller Status (32-bit)
-const REG_AQA: usize = 0x24; // Admin Queue Attributes (32-bit)
-const REG_ASQ: usize = 0x28; // Admin SQ base (64-bit)
-const REG_ACQ: usize = 0x30; // Admin CQ base (64-bit)
+const REG_CAP: usize = 0x00;
+const REG_VS: usize = 0x08;
+const REG_CC: usize = 0x14;
+const REG_CSTS: usize = 0x1C;
+const REG_AQA: usize = 0x24;
+const REG_ASQ: usize = 0x28;
+const REG_ACQ: usize = 0x30;
 
-// Admin Submission/Completion Queue depth.
-const ADMIN_QD: usize = 64;
+const ADMIN_QD: u16 = 64;
+const IO_QD: u16 = 64;
+const IO_QID: u16 = 1;
 
-// Admin Submission Queue Entry. Exactly 64 bytes per NVMe spec.
+// Admin Submission Queue Entry, exactly 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SqEntry {
@@ -49,7 +51,7 @@ const EMPTY_SQE: SqEntry = SqEntry {
     cdw15: 0,
 };
 
-// Admin Completion Queue Entry. Exactly 16 bytes per NVMe spec.
+// Completion Queue Entry, exactly 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CqEntry {
@@ -70,36 +72,89 @@ const EMPTY_CQE: CqEntry = CqEntry {
     status: 0,
 };
 
-// NVMe requires queues and data buffers to be page-aligned.
 #[repr(C, align(4096))]
 struct Page4K<T>(T);
 
-static mut ADMIN_SQ: Page4K<[SqEntry; ADMIN_QD]> = Page4K([EMPTY_SQE; ADMIN_QD]);
-static mut ADMIN_CQ: Page4K<[CqEntry; ADMIN_QD]> = Page4K([EMPTY_CQE; ADMIN_QD]);
+static mut ADMIN_SQ: Page4K<[SqEntry; ADMIN_QD as usize]> =
+    Page4K([EMPTY_SQE; ADMIN_QD as usize]);
+static mut ADMIN_CQ: Page4K<[CqEntry; ADMIN_QD as usize]> =
+    Page4K([EMPTY_CQE; ADMIN_QD as usize]);
+static mut IO_SQ: Page4K<[SqEntry; IO_QD as usize]> = Page4K([EMPTY_SQE; IO_QD as usize]);
+static mut IO_CQ: Page4K<[CqEntry; IO_QD as usize]> = Page4K([EMPTY_CQE; IO_QD as usize]);
 static mut IDENTIFY_BUF: Page4K<[u8; 4096]> = Page4K([0; 4096]);
+static mut DATA_BUF: Page4K<[u8; 4096]> = Page4K([0; 4096]);
 
 #[inline]
 fn reg_read32(base: *mut u8, off: usize) -> u32 {
     unsafe { ptr::read_volatile(base.add(off) as *const u32) }
 }
-
 #[inline]
 fn reg_write32(base: *mut u8, off: usize, v: u32) {
     unsafe { ptr::write_volatile(base.add(off) as *mut u32, v) }
 }
-
 #[inline]
 fn reg_read64(base: *mut u8, off: usize) -> u64 {
     unsafe { ptr::read_volatile(base.add(off) as *const u64) }
 }
-
 #[inline]
 fn reg_write64(base: *mut u8, off: usize, v: u64) {
     unsafe { ptr::write_volatile(base.add(off) as *mut u64, v) }
 }
 
-/// Discover the NVMe controller, initialize its admin queues, and run
-/// Identify Controller. Prints key fields on success.
+/// Runtime state for a submission/completion queue pair.
+struct Queue {
+    sq: *mut SqEntry,
+    cq: *const CqEntry,
+    qd: u16,
+    sq_doorbell: usize,
+    cq_doorbell: usize,
+    tail: u16,
+    head: u16,
+    phase: u16,
+}
+
+struct Controller {
+    base: *mut u8,
+    admin: Queue,
+    io: Option<Queue>,
+}
+
+/// Submit a command and spin-poll for its completion. Free function so the
+/// caller can split-borrow `base` and the queue out of `Controller`.
+fn submit(base: *mut u8, q: &mut Queue, mut cmd: SqEntry) -> CqEntry {
+    // Use the slot index as the CID so the completion is unambiguous.
+    let cid = q.tail;
+    cmd.cdw0 = (cmd.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+
+    unsafe {
+        q.sq.add(q.tail as usize).write(cmd);
+    }
+    q.tail = (q.tail + 1) % q.qd;
+    reg_write32(base, q.sq_doorbell, q.tail as u32);
+
+    let cqe = loop {
+        let e = unsafe { ptr::read_volatile(q.cq.add(q.head as usize)) };
+        if (e.status & 1) == q.phase {
+            break e;
+        }
+        core::hint::spin_loop();
+    };
+
+    q.head = (q.head + 1) % q.qd;
+    if q.head == 0 {
+        q.phase ^= 1;
+    }
+    reg_write32(base, q.cq_doorbell, q.head as u32);
+
+    cqe
+}
+
+fn status_code(cqe: &CqEntry) -> u16 {
+    (cqe.status >> 1) & 0x7FF
+}
+
+/// Discover the NVMe controller, bring it up, create one I/O queue pair, and
+/// round-trip a block to confirm DMA works end-to-end.
 pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
     let Some(addr) = pci::find_device(0x01, 0x08) else {
         serial_println!("NVMe: no controller found");
@@ -120,98 +175,162 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) {
     let vs = reg_read32(base, REG_VS);
     serial_println!("NVMe: BAR0 = {:#x}, CAP = {:#x}, VS = {:#x}", bar0, cap, vs);
 
-    // Disable the controller before reconfiguring admin queues.
     reg_write32(base, REG_CC, 0);
     while reg_read32(base, REG_CSTS) & 1 != 0 {
         core::hint::spin_loop();
     }
 
-    // Translate kernel-side static buffers to their physical frames so the
-    // controller can DMA into them.
-    let sq_virt = VirtAddr::new(&raw const ADMIN_SQ as u64);
-    let cq_virt = VirtAddr::new(&raw const ADMIN_CQ as u64);
-    let id_virt = VirtAddr::new(&raw const IDENTIFY_BUF as u64);
-    let sq_phys = mapper
-        .translate_addr(sq_virt)
-        .expect("ADMIN_SQ has no physical mapping");
-    let cq_phys = mapper
-        .translate_addr(cq_virt)
-        .expect("ADMIN_CQ has no physical mapping");
-    let id_phys = mapper
-        .translate_addr(id_virt)
-        .expect("IDENTIFY_BUF has no physical mapping");
+    let asq_phys = translate(mapper, &raw const ADMIN_SQ as u64);
+    let acq_phys = translate(mapper, &raw const ADMIN_CQ as u64);
+    let iosq_phys = translate(mapper, &raw const IO_SQ as u64);
+    let iocq_phys = translate(mapper, &raw const IO_CQ as u64);
+    let id_phys = translate(mapper, &raw const IDENTIFY_BUF as u64);
+    let data_phys = translate(mapper, &raw const DATA_BUF as u64);
 
-    // AQA: ACQS and ASQS are 0-based, so size N is encoded as N-1.
     let aqa = (((ADMIN_QD - 1) as u32) << 16) | ((ADMIN_QD - 1) as u32);
     reg_write32(base, REG_AQA, aqa);
-    reg_write64(base, REG_ASQ, sq_phys.as_u64());
-    reg_write64(base, REG_ACQ, cq_phys.as_u64());
+    reg_write64(base, REG_ASQ, asq_phys);
+    reg_write64(base, REG_ACQ, acq_phys);
 
-    // CC: EN=1, IOSQES=6 (64-byte SQE), IOCQES=4 (16-byte CQE). Other fields 0.
     let cc = (6 << 16) | (4 << 20) | 1;
     reg_write32(base, REG_CC, cc);
 
-    // Wait for CSTS.RDY. Abort if CSTS.CFS (bit 1) lights up.
     loop {
         let csts = reg_read32(base, REG_CSTS);
         if csts & 1 != 0 {
             break;
         }
         if csts & 2 != 0 {
-            serial_println!("NVMe: controller fatal status, CSTS = {:#x}", csts);
+            serial_println!("NVMe: fatal status CSTS = {:#x}", csts);
             return;
         }
         core::hint::spin_loop();
     }
     serial_println!("NVMe: controller enabled");
 
-    // Build Identify Controller command at SQ slot 0.
-    // Opcode 0x06, CID=0, NSID=0, PRP1 = buffer physical, CDW10.CNS = 0x01.
-    unsafe {
-        let sq = &raw mut ADMIN_SQ;
-        let slot = &mut (*sq).0[0];
-        *slot = EMPTY_SQE;
-        slot.cdw0 = 0x06; // opcode only; CID = 0
-        slot.prp1 = id_phys.as_u64();
-        slot.cdw10 = 0x01; // CNS = Identify Controller
-    }
-
-    // Ring Admin SQ tail doorbell. DSTRD = CAP[51:48].
     let dstrd = ((cap >> 32) >> 16) as usize & 0xF;
-    let sq_tail_db = 0x1000 + 0 * (4 << dstrd);
-    let cq_head_db = 0x1000 + 1 * (4 << dstrd);
-    reg_write32(base, sq_tail_db, 1);
+    let stride = 4 << dstrd;
 
-    // Poll completion slot 0 until the phase bit flips to 1.
-    let completion;
-    loop {
-        let cqe = unsafe { ptr::read_volatile(&raw const (*(&raw const ADMIN_CQ)).0[0]) };
-        if cqe.status & 1 != 0 {
-            completion = cqe;
-            break;
-        }
-        core::hint::spin_loop();
+    let mut ctrl = Controller {
+        base,
+        admin: Queue {
+            sq: &raw mut ADMIN_SQ as *mut SqEntry,
+            cq: &raw const ADMIN_CQ as *const CqEntry,
+            qd: ADMIN_QD,
+            sq_doorbell: 0x1000,
+            cq_doorbell: 0x1000 + stride,
+            tail: 0,
+            head: 0,
+            phase: 1,
+        },
+        io: None,
+    };
+
+    // Identify Controller (CNS = 0x01).
+    let mut cmd = EMPTY_SQE;
+    cmd.cdw0 = 0x06;
+    cmd.prp1 = id_phys;
+    cmd.cdw10 = 0x01;
+    let cqe = submit(ctrl.base, &mut ctrl.admin, cmd);
+    if status_code(&cqe) != 0 {
+        serial_println!("NVMe: Identify failed, status = {:#x}", cqe.status);
+        return;
     }
-    // Acknowledge: advance CQ head to 1.
-    reg_write32(base, cq_head_db, 1);
+    unsafe {
+        let buf = &(*(&raw const IDENTIFY_BUF)).0;
+        let sn = core::str::from_utf8(&buf[4..24]).unwrap_or("?");
+        let mn = core::str::from_utf8(&buf[24..64]).unwrap_or("?");
+        serial_println!("NVMe: SN = {:?}, MN = {:?}", sn.trim(), mn.trim());
+    }
 
-    // NVMe status: bit 0 is phase, bits 15:1 are the status field.
-    let status_code = (completion.status >> 1) & 0xFF;
-    if status_code != 0 {
-        serial_println!("NVMe: Identify failed, status = {:#x}", completion.status);
+    // Create I/O Completion Queue (opcode 0x05).
+    let mut cmd = EMPTY_SQE;
+    cmd.cdw0 = 0x05;
+    cmd.prp1 = iocq_phys;
+    cmd.cdw10 = (((IO_QD - 1) as u32) << 16) | (IO_QID as u32);
+    cmd.cdw11 = 1; // PC=1 (physically contiguous), IEN=0
+    let cqe = submit(ctrl.base, &mut ctrl.admin, cmd);
+    if status_code(&cqe) != 0 {
+        serial_println!("NVMe: Create I/O CQ failed, status = {:#x}", cqe.status);
         return;
     }
 
-    // Parse the Identify Controller data (NVMe spec figure for CNS 01h).
+    // Create I/O Submission Queue (opcode 0x01).
+    let mut cmd = EMPTY_SQE;
+    cmd.cdw0 = 0x01;
+    cmd.prp1 = iosq_phys;
+    cmd.cdw10 = (((IO_QD - 1) as u32) << 16) | (IO_QID as u32);
+    cmd.cdw11 = ((IO_QID as u32) << 16) | 1; // CQID in high half, PC=1
+    let cqe = submit(ctrl.base, &mut ctrl.admin, cmd);
+    if status_code(&cqe) != 0 {
+        serial_println!("NVMe: Create I/O SQ failed, status = {:#x}", cqe.status);
+        return;
+    }
+    serial_println!("NVMe: I/O queue pair {} ready", IO_QID);
+
+    ctrl.io = Some(Queue {
+        sq: &raw mut IO_SQ as *mut SqEntry,
+        cq: &raw const IO_CQ as *const CqEntry,
+        qd: IO_QD,
+        sq_doorbell: 0x1000 + 2 * stride,
+        cq_doorbell: 0x1000 + 3 * stride,
+        tail: 0,
+        head: 0,
+        phase: 1,
+    });
+
+    // Fill DATA_BUF with a recognizable pattern, write it to LBA 0.
     unsafe {
-        let buf = &(*(&raw const IDENTIFY_BUF)).0;
-        let vid = u16::from_le_bytes([buf[0], buf[1]]);
-        let sn = core::str::from_utf8(&buf[4..24]).unwrap_or("?");
-        let mn = core::str::from_utf8(&buf[24..64]).unwrap_or("?");
-        let fr = core::str::from_utf8(&buf[64..72]).unwrap_or("?");
-        serial_println!("NVMe: VID = {:#06x}", vid);
-        serial_println!("NVMe: SN  = {:?}", sn.trim());
-        serial_println!("NVMe: MN  = {:?}", mn.trim());
-        serial_println!("NVMe: FR  = {:?}", fr.trim());
+        let buf = &mut (*(&raw mut DATA_BUF)).0;
+        for (i, b) in buf.iter_mut().take(512).enumerate() {
+            *b = ((i * 7 + 11) & 0xFF) as u8;
+        }
+    }
+
+    let mut cmd = EMPTY_SQE;
+    cmd.cdw0 = 0x01; // I/O Write
+    cmd.nsid = 1;
+    cmd.prp1 = data_phys;
+    // CDW10/11 = starting LBA (0), CDW12 = (NLB - 1) = 0 means 1 block.
+    let cqe = submit(ctrl.base, ctrl.io.as_mut().unwrap(), cmd);
+    if status_code(&cqe) != 0 {
+        serial_println!("NVMe: Write failed, status = {:#x}", cqe.status);
+        return;
+    }
+
+    // Zero the buffer to make sure the read actually repopulates it.
+    unsafe {
+        let buf = &mut (*(&raw mut DATA_BUF)).0;
+        for b in buf.iter_mut().take(512) {
+            *b = 0;
+        }
+    }
+
+    let mut cmd = EMPTY_SQE;
+    cmd.cdw0 = 0x02; // I/O Read
+    cmd.nsid = 1;
+    cmd.prp1 = data_phys;
+    let cqe = submit(ctrl.base, ctrl.io.as_mut().unwrap(), cmd);
+    if status_code(&cqe) != 0 {
+        serial_println!("NVMe: Read failed, status = {:#x}", cqe.status);
+        return;
+    }
+
+    let ok = unsafe {
+        let buf = &(*(&raw const DATA_BUF)).0;
+        (0..512).all(|i| buf[i] == ((i * 7 + 11) & 0xFF) as u8)
+    };
+    if ok {
+        serial_println!("NVMe: LBA 0 write/read round trip OK (512 bytes verified)");
+    } else {
+        serial_println!("NVMe: LBA 0 round trip MISMATCH");
     }
 }
+
+fn translate(mapper: &impl Translate, vaddr: u64) -> u64 {
+    mapper
+        .translate_addr(VirtAddr::new(vaddr))
+        .expect("kernel buffer is not mapped")
+        .as_u64()
+}
+
