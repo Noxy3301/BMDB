@@ -1,0 +1,13 @@
+[package]
+name = "bmdb-serial"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+uart_16550.workspace = true
+spin.workspace = true
+lazy_static.workspace = true

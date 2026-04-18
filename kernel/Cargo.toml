@@ -1,0 +1,30 @@
+[package]
+name = "bmdb-kernel"
+version.workspace = true
+edition.workspace = true
+
+# The default test/bench harnesses pull in std, which is unavailable on bare metal.
+[[bin]]
+name = "bmdb"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+bootloader.workspace = true
+x86_64.workspace = true
+lazy_static.workspace = true
+bmdb-serial.workspace = true
+bmdb-pci.workspace = true
+bmdb-nvme.workspace = true
+
+# QEMU flags used by `bootimage runner` when `cargo run`.
+# -display none keeps it headless; -serial stdio routes COM1 to the terminal.
+# The NVMe device is backed by nvme.img (created with `qemu-img create -f raw nvme.img 128M`).
+[package.metadata.bootimage]
+run-args = [
+    "-serial", "stdio",
+    "-display", "none",
+    "-drive", "file=nvme.img,format=raw,if=none,id=nvme0",
+    "-device", "nvme,serial=BMDB0001,drive=nvme0",
+]

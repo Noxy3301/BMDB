@@ -2,8 +2,13 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
-use bmdb::{hlt_loop, memory, nvme, pci, serial_println};
+mod gdt;
+mod interrupts;
+mod memory;
+
+use bmdb_serial::serial_println;
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use x86_64::{VirtAddr, registers::control::Cr3};
@@ -13,7 +18,7 @@ entry_point!(kernel_main);
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("Hello, BMDB");
 
-    bmdb::init();
+    init();
 
     // Sanity-check the IDT by triggering a breakpoint.
     x86_64::instructions::interrupts::int3();
@@ -29,12 +34,25 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
 
     serial_println!("PCI devices on bus 0:");
-    pci::scan_bus(0);
+    bmdb_pci::scan_bus(0);
 
-    nvme::init(phys_mem_offset, &mapper);
+    bmdb_nvme::init(phys_mem_offset, &mapper);
 
     serial_println!("It did not crash!");
     hlt_loop();
+}
+
+fn init() {
+    gdt::init();
+    interrupts::init_idt();
+}
+
+/// Halt the CPU until the next interrupt. Used in idle loops to avoid burning
+/// power on a tight spin.
+fn hlt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 #[panic_handler]

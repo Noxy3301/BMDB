@@ -1,7 +1,10 @@
 //! NVMe controller initialization, admin/I/O queue management, and a
 //! write-read round trip to verify end-to-end DMA.
 
-use crate::{pci, serial_println};
+#![no_std]
+
+use bmdb_pci as pci;
+use bmdb_serial::serial_println;
 use core::ptr;
 use x86_64::{VirtAddr, structures::paging::Translate};
 
@@ -333,4 +336,3 @@ fn translate(mapper: &impl Translate, vaddr: u64) -> u64 {
         .expect("kernel buffer is not mapped")
         .as_u64()
 }
-

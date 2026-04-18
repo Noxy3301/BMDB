@@ -1,6 +1,7 @@
 //! CPU exception handlers.
 
-use crate::{gdt, serial_println};
+use crate::gdt;
+use bmdb_serial::serial_println;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 

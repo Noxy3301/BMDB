@@ -3,7 +3,9 @@
 //! Works on all x86 PCs without extra setup. PCIe extended config (beyond the
 //! first 256 bytes) is not reachable this way; use ECAM for that.
 
-use crate::serial_println;
+#![no_std]
+
+use bmdb_serial::serial_println;
 use x86_64::instructions::port::Port;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;

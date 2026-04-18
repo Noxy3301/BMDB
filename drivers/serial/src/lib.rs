@@ -1,5 +1,7 @@
 //! Serial (COM1) output for early-boot diagnostics.
 
+#![no_std]
+
 use lazy_static::lazy_static;
 use spin::Mutex;
 use uart_16550::{Config, Uart16550Tty, backend::PioBackend};
@@ -23,7 +25,7 @@ pub fn _print(args: core::fmt::Arguments) {
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
-        $crate::serial::_print(format_args!($($arg)*));
+        $crate::_print(format_args!($($arg)*));
     };
 }
 
