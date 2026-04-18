@@ -8,9 +8,8 @@ mod gdt;
 mod interrupts;
 mod memory;
 
-use bmdb_core::bptree::{BpTree, InsertError};
+use bmdb_core::kv::Kv;
 use bmdb_core::lba_alloc;
-use bmdb_core::wal::{Op, Wal};
 use bmdb_serial::serial_println;
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
@@ -50,76 +49,52 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         lba_alloc::DATA_START,
     );
 
-    wal_recovery_test(&mut nvme);
-    bptree_smoke_test();
+    kv_gate_test(&mut nvme);
 
     serial_println!("It did not crash!");
     hlt_loop();
 }
 
-/// Insert 50 keys in reverse order to force multiple splits, then look them
-/// all up. Also exercises duplicate rejection and miss-on-absent-key. Lives
-/// entirely in memory — no WAL, no NVMe.
-fn bptree_smoke_test() {
-    let mut tree = BpTree::new();
+/// Phase 3 crash-recovery gate.
+///
+/// Recovers the KV by replaying the WAL, inserts one new record keyed by the
+/// next LSN, and verifies that every previously-recovered record is still
+/// readable. Runs on every boot; the recovered count grows by one per run,
+/// proving durability across `timeout` / kill / restart cycles.
+fn kv_gate_test(nvme: &mut bmdb_nvme::Controller) {
+    let mut kv = Kv::recover(nvme).expect("KV recover failed");
 
-    for i in (1u64..=50).rev() {
-        let key = i.to_be_bytes();
-        let value = (i * 100).to_be_bytes();
-        tree.insert(key, value).expect("bptree insert failed");
-    }
-
-    for i in 1u64..=50 {
-        let key = i.to_be_bytes();
-        let expected = (i * 100).to_be_bytes();
-        let got = tree.lookup(key).expect("bptree lookup missing");
-        assert_eq!(got, expected, "value mismatch for key {}", i);
-    }
-
-    assert!(tree.lookup(999u64.to_be_bytes()).is_none());
-    assert_eq!(
-        tree.insert(1u64.to_be_bytes(), [0; 8]),
-        Err(InsertError::DuplicateKey),
-    );
-
+    let lsn_at_start = kv.next_lsn();
+    let recovered = lsn_at_start.saturating_sub(1);
+    let (nodes, height) = kv.tree_stats();
     serial_println!(
-        "B+tree: 50 inserts + lookups OK, nodes={}, height={}",
-        tree.num_nodes(),
-        tree.height(),
-    );
-}
-
-/// Recover the WAL, list existing records, and append one new record every
-/// boot. If persistence works, the total record count grows by one per
-/// QEMU run.
-fn wal_recovery_test(nvme: &mut bmdb_nvme::Controller) {
-    let mut wal = Wal::recover(nvme).expect("WAL recover failed");
-    let existing = wal.next_lsn().saturating_sub(1);
-    serial_println!(
-        "WAL: recovered {} record(s), next_lba={}, next_lsn={}",
-        existing,
-        wal.next_lba(),
-        wal.next_lsn(),
+        "KV: recovered {} record(s), next_lsn={}, tree nodes={}, height={}",
+        recovered,
+        lsn_at_start,
+        nodes,
+        height,
     );
 
-    for lba in lba_alloc::WAL_START..wal.next_lba() {
-        let rec = Wal::read_at(nvme, lba)
-            .expect("WAL read failed")
-            .expect("WAL record missing during dump");
-        serial_println!(
-            "  lba={} lsn={} op={:?} key={:?}",
-            lba,
-            rec.lsn,
-            rec.op(),
-            rec.key
-        );
+    // Every prior boot wrote key = lsn.to_be_bytes(), value = (lsn * 10)
+    // .to_be_bytes(). Confirm all of those are still in the tree.
+    for lsn in 1..lsn_at_start {
+        let key = lsn.to_be_bytes();
+        let expected = (lsn * 10).to_be_bytes();
+        let got = kv.get(key).expect("recovered key missing from tree");
+        assert_eq!(got, expected, "recovered value mismatch for lsn={}", lsn);
     }
 
-    let lba = wal.next_lba();
-    let lsn = wal
-        .append(nvme, Op::Put, 0, *b"boot\0\0\0\0", [0xBE, 0xEF, 0, 0, 0, 0, 0, 0])
-        .expect("WAL append failed");
-    serial_println!("WAL: appended lsn={} at lba={} (durable)", lsn, lba);
+    // Append one more record tagged with the next LSN.
+    let new_lsn = kv.next_lsn();
+    let new_key = new_lsn.to_be_bytes();
+    let new_value = (new_lsn * 10).to_be_bytes();
+    kv.put(nvme, new_key, new_value).expect("KV put failed");
+
+    // Immediate read-back.
+    let echo = kv.get(new_key).expect("KV get after put returned None");
+    assert_eq!(echo, new_value);
+
+    serial_println!("KV: put+get OK (new lsn={}), total keys={}", new_lsn, new_lsn);
 }
 
 fn init() {

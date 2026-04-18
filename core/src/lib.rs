@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod bptree;
+pub mod kv;
 pub mod lba_alloc;
 pub mod storage;
 pub mod wal;
