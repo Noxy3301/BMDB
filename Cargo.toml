@@ -22,10 +22,13 @@ bench = false
 
 # QEMU flags used by `bootimage runner` when `cargo run`.
 # -display none keeps it headless; -serial stdio routes COM1 to the terminal.
+# The NVMe device is backed by nvme.img (created with `qemu-img create -f raw nvme.img 128M`).
 [package.metadata.bootimage]
 run-args = [
     "-serial", "stdio",
     "-display", "none",
+    "-drive", "file=nvme.img,format=raw,if=none,id=nvme0",
+    "-device", "nvme,serial=BMDB0001,drive=nvme0",
 ]
 
 # Unwinding needs runtime support; abort keeps panic handling self-contained.
