@@ -336,6 +336,19 @@ impl Controller {
         Ok(())
     }
 
+    /// Force all prior writes on namespace 1 to non-volatile media before
+    /// returning. Maps to the NVMe Flush command (opcode 0x00).
+    pub fn flush(&mut self) -> Result<(), IoError> {
+        let mut cmd = EMPTY_SQE;
+        cmd.cdw0 = 0x00; // Flush
+        cmd.nsid = 1;
+        let cqe = submit(self.base, &mut self.io, cmd);
+        if status_code(&cqe) != 0 {
+            return Err(IoError(cqe.status));
+        }
+        Ok(())
+    }
+
     // Keeping the admin queue on the handle lets us add admin commands later
     // (Get Log Page, Namespace Management, etc.) without re-threading state.
     #[allow(dead_code)]
@@ -353,6 +366,10 @@ impl BlockStorage for Controller {
 
     fn write_block(&mut self, lba: Lba, data: &[u8; BLOCK_SIZE]) -> Result<(), Self::Error> {
         Controller::write_block(self, lba, data)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Controller::flush(self)
     }
 }
 

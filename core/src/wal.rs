@@ -144,9 +144,12 @@ impl Wal {
         self.next_lsn
     }
 
-    /// Append one record. Returns the assigned LSN. Panics if the WAL region
-    /// is full — a circular log / checkpoint + truncate story is a later
-    /// phase problem.
+    /// Append one record. The call flushes before returning, so the record is
+    /// durable by the time the caller sees the LSN. Group-commit (one flush
+    /// per epoch) is a Silo-era optimization.
+    ///
+    /// Panics if the WAL region is full — a circular log / checkpoint +
+    /// truncate story is a later phase problem.
     pub fn append<S: BlockStorage>(
         &mut self,
         storage: &mut S,
@@ -160,10 +163,30 @@ impl Wal {
         let mut block = [0u8; BLOCK_SIZE];
         encode(&rec, &mut block);
         storage.write_block(self.next_lba, &block)?;
+        storage.flush()?;
         let lsn = self.next_lsn;
         self.next_lba += 1;
         self.next_lsn += 1;
         Ok(lsn)
+    }
+
+    /// Rebuild the WAL cursor by scanning from the start of the region. Stops
+    /// at the first block that fails magic or checksum — that's end-of-log.
+    /// Because each record occupies its own block, a torn write corrupts
+    /// exactly one record and leaves all preceding records intact.
+    pub fn recover<S: BlockStorage>(storage: &mut S) -> Result<Self, S::Error> {
+        let mut next_lba = WAL_START;
+        let mut next_lsn = 1u64;
+        while next_lba <= wal_end() {
+            match Self::read_at(storage, next_lba)? {
+                Some(rec) => {
+                    next_lsn = rec.lsn + 1;
+                    next_lba += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(Self { next_lba, next_lsn })
     }
 
     /// Read the record at `lba`. Returns `None` when the block is not a valid

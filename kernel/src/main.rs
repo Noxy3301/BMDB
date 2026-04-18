@@ -49,43 +49,43 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         lba_alloc::DATA_START,
     );
 
-    wal_smoke_test(&mut nvme);
+    wal_recovery_test(&mut nvme);
 
     serial_println!("It did not crash!");
     hlt_loop();
 }
 
-/// Append a few records and read them back. Until recovery is wired up, this
-/// only verifies that encoding, NVMe I/O, and checksums agree in one session.
-fn wal_smoke_test(nvme: &mut bmdb_nvme::Controller) {
-    let mut wal = Wal::new();
-    let sample: [(Op, [u8; 8], [u8; 8]); 3] = [
-        (Op::Put, *b"alpha\0\0\0", *b"A\0\0\0\0\0\0\0"),
-        (Op::Put, *b"bravo\0\0\0", *b"B\0\0\0\0\0\0\0"),
-        (Op::Delete, *b"alpha\0\0\0", [0; 8]),
-    ];
+/// Recover the WAL, list existing records, and append one new record every
+/// boot. If persistence works, the total record count grows by one per
+/// QEMU run.
+fn wal_recovery_test(nvme: &mut bmdb_nvme::Controller) {
+    let mut wal = Wal::recover(nvme).expect("WAL recover failed");
+    let existing = wal.next_lsn().saturating_sub(1);
+    serial_println!(
+        "WAL: recovered {} record(s), next_lba={}, next_lsn={}",
+        existing,
+        wal.next_lba(),
+        wal.next_lsn(),
+    );
 
-    let mut logged: [(u64, bmdb_core::lba_alloc::Lba); 3] =
-        [(0, 0), (0, 0), (0, 0)];
-    for (i, (op, k, v)) in sample.iter().enumerate() {
-        let lba = wal.next_lba();
-        let lsn = wal.append(nvme, *op, 0, *k, *v).expect("WAL append failed");
-        logged[i] = (lsn, lba);
-        serial_println!("WAL: append lsn={} at lba={} op={:?}", lsn, lba, op);
-    }
-
-    for (i, (expected_lsn, lba)) in logged.iter().enumerate() {
-        let rec = Wal::read_at(nvme, *lba)
+    for lba in lba_alloc::WAL_START..wal.next_lba() {
+        let rec = Wal::read_at(nvme, lba)
             .expect("WAL read failed")
-            .expect("WAL record missing");
-        assert_eq!(rec.lsn, *expected_lsn);
-        assert_eq!(rec.key, sample[i].1);
-        assert_eq!(rec.op(), Some(sample[i].0));
-        if sample[i].0 == Op::Put {
-            assert_eq!(rec.value, sample[i].2);
-        }
+            .expect("WAL record missing during dump");
+        serial_println!(
+            "  lba={} lsn={} op={:?} key={:?}",
+            lba,
+            rec.lsn,
+            rec.op(),
+            rec.key
+        );
     }
-    serial_println!("WAL: 3 records round-tripped through NVMe");
+
+    let lba = wal.next_lba();
+    let lsn = wal
+        .append(nvme, Op::Put, 0, *b"boot\0\0\0\0", [0xBE, 0xEF, 0, 0, 0, 0, 0, 0])
+        .expect("WAL append failed");
+    serial_println!("WAL: appended lsn={} at lba={} (durable)", lsn, lba);
 }
 
 fn init() {
