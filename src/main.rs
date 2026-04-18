@@ -19,7 +19,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     x86_64::instructions::interrupts::int3();
 
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    let _mapper = unsafe { memory::init(phys_mem_offset) };
+    let mapper = unsafe { memory::init(phys_mem_offset) };
 
     let (l4_frame, _) = Cr3::read();
     serial_println!(
@@ -31,7 +31,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("PCI devices on bus 0:");
     pci::scan_bus(0);
 
-    nvme::probe(phys_mem_offset);
+    nvme::init(phys_mem_offset, &mapper);
 
     serial_println!("It did not crash!");
     hlt_loop();

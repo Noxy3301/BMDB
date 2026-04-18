@@ -125,12 +125,13 @@ pub fn read_bar(addr: &PciAddress, bar_index: u8) -> u64 {
     }
 }
 
-/// Set Memory Space Enable (bit 1) in the command register so the CPU can
-/// reach the device's BARs.
-pub fn enable_mmio(addr: &PciAddress) {
+/// Enable Memory Space (bit 1) and Bus Master (bit 2) in the command register.
+/// Memory Space lets the CPU reach the device's BARs; Bus Master lets the
+/// device initiate DMA back into system RAM.
+pub fn enable_device(addr: &PciAddress) {
     // Command and status share one dword; preserve status by masking.
     let dword = read_config(addr.bus, addr.device, addr.function, 0x04);
-    let command = (dword & 0xFFFF) | (1 << 1);
+    let command = (dword & 0xFFFF) | (1 << 1) | (1 << 2);
     write_config(
         addr.bus,
         addr.device,
