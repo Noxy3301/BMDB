@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "kernel",
+    "core",
     "drivers/serial",
     "drivers/pci",
     "drivers/nvme",
@@ -17,6 +18,7 @@ uart_16550 = "0.6.0"
 spin = "0.5.2"
 x86_64 = "0.14.2"
 lazy_static = { version = "1.0", features = ["spin_no_std"] }
+bmdb-core = { path = "core" }
 bmdb-serial = { path = "drivers/serial" }
 bmdb-pci = { path = "drivers/pci" }
 bmdb-nvme = { path = "drivers/nvme" }

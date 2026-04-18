@@ -8,6 +8,7 @@ mod gdt;
 mod interrupts;
 mod memory;
 
+use bmdb_core::lba_alloc;
 use bmdb_nvme::BLOCK_SIZE;
 use bmdb_serial::serial_println;
 use bootloader::{BootInfo, entry_point};
@@ -39,18 +40,30 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     let mut nvme = bmdb_nvme::init(phys_mem_offset, &mapper).expect("NVMe init failed");
 
-    // Confirm end-to-end DMA by writing a recognizable pattern to LBA 0 and
-    // reading it back. This is temporary and will be replaced by the real
-    // storage layer.
+    serial_println!(
+        "LBA layout: superblock@{}, wal@{}..={} ({} blocks), data@{}..",
+        lba_alloc::SUPERBLOCK_LBA,
+        lba_alloc::WAL_START,
+        lba_alloc::wal_end(),
+        lba_alloc::WAL_LEN,
+        lba_alloc::DATA_START,
+    );
+
+    // Write-read a single block in the data region. Lets the driver and the
+    // region layout get exercised together until the real storage layer
+    // replaces this.
+    let probe_lba = lba_alloc::DATA_START;
     let mut pattern = [0u8; BLOCK_SIZE];
     for (i, b) in pattern.iter_mut().enumerate() {
         *b = ((i * 7 + 11) & 0xFF) as u8;
     }
-    nvme.write_block(0, &pattern).expect("write LBA 0 failed");
+    nvme.write_block(probe_lba, &pattern)
+        .expect("write data block failed");
     let mut readback = [0u8; BLOCK_SIZE];
-    nvme.read_block(0, &mut readback).expect("read LBA 0 failed");
+    nvme.read_block(probe_lba, &mut readback)
+        .expect("read data block failed");
     assert_eq!(pattern, readback);
-    serial_println!("NVMe: LBA 0 round trip OK (512 bytes verified)");
+    serial_println!("NVMe: LBA {} round trip OK (512 bytes verified)", probe_lba);
 
     serial_println!("It did not crash!");
     hlt_loop();
