@@ -3,7 +3,7 @@
 #![no_std]
 #![no_main]
 
-use bmdb::{hlt_loop, memory, pci, serial_println};
+use bmdb::{hlt_loop, memory, nvme, pci, serial_println};
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use x86_64::{VirtAddr, registers::control::Cr3};
@@ -30,6 +30,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     serial_println!("PCI devices on bus 0:");
     pci::scan_bus(0);
+
+    nvme::probe(phys_mem_offset);
 
     serial_println!("It did not crash!");
     hlt_loop();
