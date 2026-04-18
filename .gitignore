@@ -6,3 +6,6 @@
 # Editor
 .vscode/
 
+
+# QEMU disk images
+*.img
