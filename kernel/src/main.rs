@@ -9,7 +9,7 @@ mod interrupts;
 mod memory;
 
 use bmdb_core::lba_alloc;
-use bmdb_nvme::BLOCK_SIZE;
+use bmdb_core::wal::{Op, Wal};
 use bmdb_serial::serial_println;
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
@@ -49,24 +49,43 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         lba_alloc::DATA_START,
     );
 
-    // Write-read a single block in the data region. Lets the driver and the
-    // region layout get exercised together until the real storage layer
-    // replaces this.
-    let probe_lba = lba_alloc::DATA_START;
-    let mut pattern = [0u8; BLOCK_SIZE];
-    for (i, b) in pattern.iter_mut().enumerate() {
-        *b = ((i * 7 + 11) & 0xFF) as u8;
-    }
-    nvme.write_block(probe_lba, &pattern)
-        .expect("write data block failed");
-    let mut readback = [0u8; BLOCK_SIZE];
-    nvme.read_block(probe_lba, &mut readback)
-        .expect("read data block failed");
-    assert_eq!(pattern, readback);
-    serial_println!("NVMe: LBA {} round trip OK (512 bytes verified)", probe_lba);
+    wal_smoke_test(&mut nvme);
 
     serial_println!("It did not crash!");
     hlt_loop();
+}
+
+/// Append a few records and read them back. Until recovery is wired up, this
+/// only verifies that encoding, NVMe I/O, and checksums agree in one session.
+fn wal_smoke_test(nvme: &mut bmdb_nvme::Controller) {
+    let mut wal = Wal::new();
+    let sample: [(Op, [u8; 8], [u8; 8]); 3] = [
+        (Op::Put, *b"alpha\0\0\0", *b"A\0\0\0\0\0\0\0"),
+        (Op::Put, *b"bravo\0\0\0", *b"B\0\0\0\0\0\0\0"),
+        (Op::Delete, *b"alpha\0\0\0", [0; 8]),
+    ];
+
+    let mut logged: [(u64, bmdb_core::lba_alloc::Lba); 3] =
+        [(0, 0), (0, 0), (0, 0)];
+    for (i, (op, k, v)) in sample.iter().enumerate() {
+        let lba = wal.next_lba();
+        let lsn = wal.append(nvme, *op, 0, *k, *v).expect("WAL append failed");
+        logged[i] = (lsn, lba);
+        serial_println!("WAL: append lsn={} at lba={} op={:?}", lsn, lba, op);
+    }
+
+    for (i, (expected_lsn, lba)) in logged.iter().enumerate() {
+        let rec = Wal::read_at(nvme, *lba)
+            .expect("WAL read failed")
+            .expect("WAL record missing");
+        assert_eq!(rec.lsn, *expected_lsn);
+        assert_eq!(rec.key, sample[i].1);
+        assert_eq!(rec.op(), Some(sample[i].0));
+        if sample[i].0 == Op::Put {
+            assert_eq!(rec.value, sample[i].2);
+        }
+    }
+    serial_println!("WAL: 3 records round-tripped through NVMe");
 }
 
 fn init() {

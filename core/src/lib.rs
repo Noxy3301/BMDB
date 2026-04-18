@@ -7,3 +7,5 @@
 #![no_std]
 
 pub mod lba_alloc;
+pub mod storage;
+pub mod wal;

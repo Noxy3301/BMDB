@@ -3,6 +3,8 @@
 
 #![no_std]
 
+use bmdb_core::lba_alloc::{BLOCK_SIZE, Lba};
+use bmdb_core::storage::BlockStorage;
 use bmdb_pci as pci;
 use bmdb_serial::serial_println;
 use core::ptr;
@@ -20,8 +22,6 @@ const REG_ACQ: usize = 0x30;
 const ADMIN_QD: u16 = 64;
 const IO_QD: u16 = 64;
 const IO_QID: u16 = 1;
-
-pub const BLOCK_SIZE: usize = 512;
 
 // Admin Submission Queue Entry, exactly 64 bytes.
 #[repr(C)]
@@ -297,8 +297,8 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) -> Option<Contro
 }
 
 impl Controller {
-    /// Read one 512-byte block from namespace 1 into `out`.
-    pub fn read_block(&mut self, lba: u64, out: &mut [u8; BLOCK_SIZE]) -> Result<(), IoError> {
+    /// Read one block from namespace 1 into `out`.
+    pub fn read_block(&mut self, lba: Lba, out: &mut [u8; BLOCK_SIZE]) -> Result<(), IoError> {
         let mut cmd = EMPTY_SQE;
         cmd.cdw0 = 0x02; // I/O Read
         cmd.nsid = 1;
@@ -317,8 +317,8 @@ impl Controller {
         Ok(())
     }
 
-    /// Write one 512-byte block from `data` to namespace 1 at `lba`.
-    pub fn write_block(&mut self, lba: u64, data: &[u8; BLOCK_SIZE]) -> Result<(), IoError> {
+    /// Write one block from `data` to namespace 1 at `lba`.
+    pub fn write_block(&mut self, lba: Lba, data: &[u8; BLOCK_SIZE]) -> Result<(), IoError> {
         unsafe {
             let buf = &mut (*(&raw mut DATA_BUF)).0;
             buf[..BLOCK_SIZE].copy_from_slice(data);
@@ -336,12 +336,23 @@ impl Controller {
         Ok(())
     }
 
-    // Silence dead-code warnings for the admin queue once it's no longer used
-    // after init. Keeping it on the handle lets us add admin commands later
-    // (Create Namespace, Get Log Page, etc.) without re-threading state.
+    // Keeping the admin queue on the handle lets us add admin commands later
+    // (Get Log Page, Namespace Management, etc.) without re-threading state.
     #[allow(dead_code)]
     fn admin(&mut self) -> &mut Queue {
         &mut self.admin
+    }
+}
+
+impl BlockStorage for Controller {
+    type Error = IoError;
+
+    fn read_block(&mut self, lba: Lba, out: &mut [u8; BLOCK_SIZE]) -> Result<(), Self::Error> {
+        Controller::read_block(self, lba, out)
+    }
+
+    fn write_block(&mut self, lba: Lba, data: &[u8; BLOCK_SIZE]) -> Result<(), Self::Error> {
+        Controller::write_block(self, lba, data)
     }
 }
 

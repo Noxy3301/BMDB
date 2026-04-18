@@ -35,6 +35,7 @@ dependencies = [
 name = "bmdb-nvme"
 version = "0.1.0"
 dependencies = [
+ "bmdb-core",
  "bmdb-pci",
  "bmdb-serial",
  "x86_64",

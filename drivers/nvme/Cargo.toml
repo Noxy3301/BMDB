@@ -9,5 +9,6 @@ bench = false
 
 [dependencies]
 x86_64.workspace = true
+bmdb-core.workspace = true
 bmdb-serial.workspace = true
 bmdb-pci.workspace = true
