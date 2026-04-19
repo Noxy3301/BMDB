@@ -88,7 +88,8 @@ fn kv_gate_test(nvme: &mut bmdb_nvme::Controller) {
     let new_lsn = kv.next_lsn();
     let new_key = new_lsn.to_be_bytes();
     let new_value = (new_lsn * 10).to_be_bytes();
-    kv.put(nvme, new_key, new_value).expect("KV put failed");
+    let prior = kv.put(nvme, new_key, new_value).expect("KV put failed");
+    assert!(prior.is_none(), "fresh LSN should have no prior value");
 
     // Immediate read-back.
     let echo = kv.get(new_key).expect("KV get after put returned None");

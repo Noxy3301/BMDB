@@ -1,22 +1,22 @@
 //! Durable key-value store built from the WAL and the in-memory B+tree.
 //!
-//! `put` appends a WAL record (durable once the call returns) and inserts
-//! into the tree. `get` reads directly from the tree. `recover` rebuilds
-//! the tree by replaying every WAL record in order.
+//! `put` appends a WAL record (durable once the call returns) and upserts
+//! into the tree, returning the previous value if the key already existed.
+//! `delete` appends a Delete record and removes the key from the tree.
+//! `get` reads directly from the tree. `recover` rebuilds the tree by
+//! replaying every WAL record in order.
 //!
-//! Ordering on `put`: WAL first, then tree. If a crash happens between the
-//! WAL write and the tree insert, `recover` on the next boot replays the
-//! WAL record and the in-memory state is restored — the WAL is the source
-//! of truth, the tree is a cache.
+//! Ordering on `put` / `delete`: WAL first, then tree. If a crash happens
+//! between the WAL write and the tree mutation, `recover` on the next boot
+//! replays the WAL record and the in-memory state is restored — the WAL is
+//! the source of truth, the tree is a cache.
 //!
-//! Phase 3 limitations:
-//! - No update semantics: a second `put` for an existing key returns
-//!   `DuplicateKey` (the B+tree rejects duplicates). Upsert comes with a
-//!   future `BpTree::update`.
-//! - `Op::Delete` records are skipped during replay: the B+tree has no
-//!   remove yet. A Put-then-Delete-then-Put sequence will recover
-//!   incorrectly (first Put wins instead of last Put). Safe because Phase 3
-//!   doesn't expose a `delete` method.
+//! Capacity invariant: `put` refuses a new-key insert if the B+tree pool
+//! could not absorb the resulting splits, *before* the WAL append. Without
+//! that pre-check, a durable record could remain that a same-size tree
+//! cannot later replay, permanently poisoning recovery at this pool size.
+//! Overwriting an existing key never allocates, so that path is exempt
+//! from the pre-check.
 
 use crate::bptree::{BpTree, InsertError, Key, POOL_SIZE, Value};
 use crate::lba_alloc::WAL_START;
@@ -31,7 +31,6 @@ pub struct Kv {
 #[derive(Debug)]
 pub enum PutError<E> {
     Io(E),
-    DuplicateKey,
     TreeFull,
 }
 
@@ -39,10 +38,6 @@ pub enum PutError<E> {
 pub enum RecoverError<E> {
     Io(E),
     TreeFull,
-    /// Two `Op::Put` records for the same key during replay. Indicates the
-    /// WAL was written by code that supported upsert, but this version does
-    /// not.
-    DuplicateReplay,
     /// A WAL record with an unrecognized operation code. Either the WAL was
     /// written by a newer version or the record is corrupt.
     MalformedRecord,
@@ -69,13 +64,22 @@ impl Kv {
                 .expect("recovered WAL contains invalid record at known-valid LBA");
             match rec.op() {
                 Some(Op::Put) => {
-                    tree.insert(rec.key, rec.value).map_err(|e| match e {
-                        InsertError::DuplicateKey => RecoverError::DuplicateReplay,
+                    // Upsert (not insert): replaying a sequence like
+                    // Put(k, v1) → Put(k, v2) leaves the latest value in
+                    // the tree, matching the semantics of runtime `put`.
+                    tree.upsert(rec.key, rec.value).map_err(|e| match e {
                         InsertError::NodePoolExhausted => RecoverError::TreeFull,
+                        InsertError::DuplicateKey => {
+                            unreachable!("upsert cannot return DuplicateKey")
+                        }
                     })?;
                 }
                 Some(Op::Delete) => {
-                    // Deferred: B+tree has no remove yet.
+                    // Deleting an absent key is a no-op; the return value is
+                    // discarded. This handles both an honest delete and a
+                    // Delete-for-absent-key produced by unconditional
+                    // `Kv::delete` below.
+                    let _ = tree.delete(rec.key);
                 }
                 None => {
                     return Err(RecoverError::MalformedRecord);
@@ -87,36 +91,49 @@ impl Kv {
         Ok(Self { wal, tree })
     }
 
-    /// Insert a new key/value pair. The record is durable before this call
-    /// returns. Rejects `DuplicateKey` and `TreeFull` *before* touching the
-    /// WAL so that a durable record is never produced that a same-size tree
-    /// cannot later replay.
+    /// Insert a new key/value pair, or overwrite the value if the key is
+    /// already present. The record is durable before this call returns.
+    /// Returns the previous value when overwriting, `None` for a fresh
+    /// insert.
+    ///
+    /// Rejects `TreeFull` *before* touching the WAL on the new-key path so
+    /// that a durable record is never produced that a same-size tree cannot
+    /// later replay. An overwrite never allocates and is therefore allowed
+    /// even when the tree pool is otherwise full.
     pub fn put<S: BlockStorage>(
         &mut self,
         storage: &mut S,
         key: Key,
         value: Value,
-    ) -> Result<(), PutError<S::Error>> {
-        if self.tree.lookup(key).is_some() {
-            return Err(PutError::DuplicateKey);
-        }
-        // The tree's own pre-check is identical to this one; mirror it here
-        // so the durable WAL append never runs if the tree is already full.
-        // Without this mirror, a `TreeFull` after `wal.append` would leave a
-        // record the next `recover` cannot absorb, permanently poisoning
-        // recovery at this pool size.
-        if !self.tree_has_capacity_for_insert() {
+    ) -> Result<Option<Value>, PutError<S::Error>> {
+        let will_allocate = self.tree.lookup(key).is_none();
+        if will_allocate && !self.tree_has_capacity_for_insert() {
             return Err(PutError::TreeFull);
         }
         self.wal
             .append(storage, Op::Put, 0, key, value)
             .map_err(PutError::Io)?;
-        // Both preconditions are now established: neither arm can fire.
-        self.tree.insert(key, value).map_err(|e| match e {
-            InsertError::DuplicateKey => PutError::DuplicateKey,
-            InsertError::NodePoolExhausted => PutError::TreeFull,
-        })?;
-        Ok(())
+        // Pre-check guarantees this cannot fail: an existing key takes the
+        // alloc-free fast path, and a new key has reserved capacity.
+        let old = self
+            .tree
+            .upsert(key, value)
+            .expect("tree.upsert after capacity pre-check must succeed");
+        Ok(old)
+    }
+
+    /// Remove `key` from the store. The Delete record is durable before
+    /// this call returns, regardless of whether the key was actually
+    /// present — so recovery sees exactly the same Delete sequence the
+    /// caller issued. Returns the removed value, or `None` if the key was
+    /// absent.
+    pub fn delete<S: BlockStorage>(
+        &mut self,
+        storage: &mut S,
+        key: Key,
+    ) -> Result<Option<Value>, S::Error> {
+        self.wal.append(storage, Op::Delete, 0, key, [0; 8])?;
+        Ok(self.tree.delete(key))
     }
 
     fn tree_has_capacity_for_insert(&self) -> bool {
@@ -163,27 +180,53 @@ mod tests {
     fn put_then_get_returns_value() {
         let mut storage = MemStorage::new();
         let mut kv = Kv::new();
-        kv.put(&mut storage, k(1), v(1)).unwrap();
+        let old = kv.put(&mut storage, k(1), v(1)).unwrap();
+        assert_eq!(old, None);
         assert_eq!(kv.get(k(1)), Some(v(1)));
         assert_eq!(kv.get(k(2)), None);
     }
 
     #[test]
-    fn duplicate_put_rejected_without_wal_write() {
+    fn put_overwrites_existing_key_and_returns_old_value() {
         let mut storage = MemStorage::new();
         let mut kv = Kv::new();
         kv.put(&mut storage, k(1), v(1)).unwrap();
         let flushes_before = storage.flush_count();
 
-        let err = kv.put(&mut storage, k(1), v(99));
-        assert!(matches!(err, Err(PutError::DuplicateKey)));
+        let old = kv.put(&mut storage, k(1), v(99)).unwrap();
+        assert_eq!(old, Some(v(1)));
+        assert_eq!(kv.get(k(1)), Some(v(99)));
 
-        // No WAL append should have happened for the rejected put: flush
-        // count is unchanged and LSN has not advanced.
-        assert_eq!(storage.flush_count(), flushes_before);
+        // Overwrite must have written a fresh WAL record: both LSN and
+        // flush count advance.
+        assert!(storage.flush_count() > flushes_before);
+        assert_eq!(kv.next_lsn(), 3);
+    }
+
+    #[test]
+    fn delete_removes_key_and_returns_old_value() {
+        let mut storage = MemStorage::new();
+        let mut kv = Kv::new();
+        kv.put(&mut storage, k(5), v(5)).unwrap();
+
+        let removed = kv.delete(&mut storage, k(5)).unwrap();
+        assert_eq!(removed, Some(v(5)));
+        assert_eq!(kv.get(k(5)), None);
+    }
+
+    #[test]
+    fn delete_of_absent_key_returns_none_but_still_appends_wal() {
+        let mut storage = MemStorage::new();
+        let mut kv = Kv::new();
+        let flushes_before = storage.flush_count();
+
+        let removed = kv.delete(&mut storage, k(42)).unwrap();
+        assert_eq!(removed, None);
+
+        // The WAL record is written unconditionally so recovery sees the
+        // same Delete sequence the caller issued.
+        assert!(storage.flush_count() > flushes_before);
         assert_eq!(kv.next_lsn(), 2);
-        // Original value survives.
-        assert_eq!(kv.get(k(1)), Some(v(1)));
     }
 
     #[test]
@@ -213,25 +256,45 @@ mod tests {
     }
 
     #[test]
-    fn recover_skips_delete_records() {
-        // Phase 3 limitation: Delete records are skipped during replay
-        // because BpTree has no remove yet. To prove "skip" semantics (and
-        // not "actually delete"), put a key, then delete it, then recover
-        // and confirm the key survives. If replay honored Delete, the key
-        // would be gone.
+    fn recover_applies_delete_records() {
+        // Put a key, delete it, recover. The delete must take effect during
+        // replay, otherwise the key would remain.
         let mut storage = MemStorage::new();
-        let mut wal = Wal::new();
-
-        wal.append(&mut storage, Op::Put, 0, k(7), v(7)).unwrap();
-        wal.append(&mut storage, Op::Delete, 0, k(7), [0; 8]).unwrap();
-
+        {
+            let mut kv = Kv::new();
+            kv.put(&mut storage, k(7), v(7)).unwrap();
+            kv.delete(&mut storage, k(7)).unwrap();
+        }
         let kv = Kv::recover(&mut storage).unwrap();
-        assert_eq!(
-            kv.get(k(7)),
-            Some(v(7)),
-            "Delete record must be skipped, not applied",
-        );
+        assert_eq!(kv.get(k(7)), None, "Delete must be applied during replay");
         assert_eq!(kv.next_lsn(), 3);
+    }
+
+    #[test]
+    fn recover_preserves_last_value_on_put_delete_put_sequence() {
+        let mut storage = MemStorage::new();
+        {
+            let mut kv = Kv::new();
+            kv.put(&mut storage, k(3), v(1)).unwrap(); // v1
+            kv.delete(&mut storage, k(3)).unwrap();
+            kv.put(&mut storage, k(3), v(2)).unwrap(); // v2 is the survivor
+        }
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.get(k(3)), Some(v(2)));
+    }
+
+    #[test]
+    fn recover_handles_overwrite_in_log() {
+        // Two Puts on the same key: replay must land the second value,
+        // mirroring the runtime upsert semantics of `put`.
+        let mut storage = MemStorage::new();
+        {
+            let mut kv = Kv::new();
+            kv.put(&mut storage, k(9), v(1)).unwrap();
+            kv.put(&mut storage, k(9), v(2)).unwrap();
+        }
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.get(k(9)), Some(v(2)));
     }
 
     #[test]
@@ -264,5 +327,70 @@ mod tests {
         }
         let (_nodes, height) = kv.tree_stats();
         assert!(height >= 2, "40 inserts should grow the tree beyond a single leaf");
+    }
+
+    #[test]
+    fn put_and_delete_survive_multiple_crash_cycles() {
+        // Three boots, two simulated crashes: put → crash → recover+delete
+        // → crash → recover. Verifies that Delete records written in one
+        // boot are correctly applied when replayed in the next.
+        let mut storage = MemStorage::new();
+        {
+            let mut kv = Kv::new();
+            kv.put(&mut storage, k(1), v(1)).unwrap();
+            kv.put(&mut storage, k(2), v(2)).unwrap();
+        }
+        {
+            let mut kv = Kv::recover(&mut storage).unwrap();
+            assert_eq!(kv.get(k(1)), Some(v(1)));
+            assert_eq!(kv.get(k(2)), Some(v(2)));
+            kv.delete(&mut storage, k(1)).unwrap();
+            kv.put(&mut storage, k(3), v(3)).unwrap();
+        }
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.get(k(1)), None);
+        assert_eq!(kv.get(k(2)), Some(v(2)));
+        assert_eq!(kv.get(k(3)), Some(v(3)));
+    }
+
+    #[test]
+    fn put_overwrite_succeeds_when_tree_pool_full() {
+        // Fill the tree pool until a new-key put fails, then overwrite an
+        // existing key. The in-place upsert must succeed even though no
+        // new-key insert would fit.
+        let mut storage = MemStorage::new();
+        let mut kv = Kv::new();
+
+        let mut last_inserted = 0u64;
+        for i in 1..=10_000u64 {
+            match kv.put(&mut storage, k(i), v(i)) {
+                Ok(_) => last_inserted = i,
+                Err(PutError::TreeFull) => break,
+                Err(e) => panic!("unexpected error during fill: {:?}", e),
+            }
+        }
+        // A fresh key must still be rejected.
+        let rejected = kv.put(&mut storage, k(last_inserted + 1), v(0));
+        assert!(matches!(rejected, Err(PutError::TreeFull)));
+
+        // But an existing-key overwrite must succeed.
+        let old = kv
+            .put(&mut storage, k(1), v(42))
+            .expect("overwrite must succeed on full pool");
+        assert_eq!(old, Some(v(1)));
+        assert_eq!(kv.get(k(1)), Some(v(42)));
+    }
+
+    #[test]
+    fn delete_of_absent_key_during_recover_is_noop() {
+        // Synthetic WAL: Delete for a key that was never Put. Replay must
+        // absorb it without error.
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        wal.append(&mut storage, Op::Delete, 0, k(99), [0; 8]).unwrap();
+
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.get(k(99)), None);
+        assert_eq!(kv.next_lsn(), 2);
     }
 }
