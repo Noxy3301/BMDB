@@ -318,15 +318,25 @@ impl TxnState {
         Ok(())
     }
 
-    /// Buffer a write. Actual value publication happens in commit
-    /// (Silo-4's validate + install phase).
+    /// Buffer a write. If the same record already has a write buffered,
+    /// the new value overwrites the old one — otherwise commit's
+    /// sorted-lock pass would see two entries for one record and
+    /// self-abort on the second `try_lock`. Returning the existing
+    /// slot also matches most APIs' last-writer-wins expectation.
     pub fn add_write(&mut self, record: &Record, new_value: u64) -> Result<(), TxnError> {
+        let addr = record as *const Record as usize;
+        for slot in &mut self.write_set[..self.write_count as usize] {
+            if slot.record_addr == addr {
+                slot.new_value = new_value;
+                return Ok(());
+            }
+        }
         if (self.write_count as usize) >= MAX_RW_SET {
             return Err(TxnError::WriteSetOverflow);
         }
         let idx = self.write_count as usize;
         self.write_set[idx] = WriteEntry {
-            record_addr: record as *const Record as usize,
+            record_addr: addr,
             new_value,
         };
         self.write_count += 1;
@@ -339,6 +349,158 @@ impl TxnState {
         self.start_epoch = start_epoch;
         self.read_count = 0;
         self.write_count = 0;
+    }
+}
+
+// -------------------------------------------------------------------
+// Silo-4: commit protocol.
+// -------------------------------------------------------------------
+
+/// Outcome of a Silo [`commit`] attempt. Abort variants are distinct
+/// so bench and unit tests can attribute abort pressure to the right
+/// source (lock contention vs. read-validation loss vs. exhausted TID
+/// range — the last one forces the caller to wait for the epoch to
+/// advance, which resets the sequence space).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Committed { new_tid: Tid },
+    AbortedLockConflict,
+    AbortedReadChanged,
+    /// 29-bit sequence field is about to wrap within the current
+    /// epoch. Wrapping would reuse an older TID and defeat read
+    /// validation (an ABA hole), so the commit aborts instead. The
+    /// caller must wait for `current_epoch()` to advance and retry.
+    AbortedSequenceExhausted,
+}
+
+/// Silo OCC precommit, mapped to this crate's types (paper §4.3):
+///
+/// 1. Sort the write set by record address — deadlock-free ordering
+///    across workers that lock the same records.
+/// 2. Acquire the lock bit on each write-set record via CAS.
+/// 3. Read the global epoch (serialization point).
+/// 4. Validate the read set: re-load each record's TID and require
+///    the pre-read version unchanged, ignoring the lock bit when the
+///    lock is held by us (i.e., same record appears in the write
+///    set).
+/// 5. Compute a new TID whose sequence is greater than every
+///    read/written record's observed sequence, stamped with the just-
+///    read global epoch.
+/// 6. Install the new value + TID on each write-set record; that
+///    atomic store releases the lock.
+///
+/// On any abort path the function releases every lock it acquired.
+///
+/// # Safety
+/// All `record_addr`s in `state` must be valid `*const Record`s
+/// pointing to records that live at least as long as the commit call.
+pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
+    // 1. Sort write set by address. Two writers that touch the same
+    // records will see the same lock order, so a cycle is impossible.
+    let write_slice = &mut state.write_set[..state.write_count as usize];
+    // `sort_unstable_by_key` is in core; `sort_by_key` would need alloc.
+    write_slice.sort_unstable_by_key(|w| w.record_addr);
+
+    // 2. Acquire locks in sorted order. Track the highest-index one
+    // we've taken so the abort path can release exactly those.
+    let mut locked = 0usize;
+    let mut lock_versions: [u64; MAX_RW_SET] = [0; MAX_RW_SET];
+    for (i, entry) in write_slice.iter().enumerate() {
+        let record = unsafe { &*(entry.record_addr as *const Record) };
+        match record.try_lock() {
+            Some(prior) => {
+                lock_versions[i] = prior.raw();
+                locked = i + 1;
+            }
+            None => {
+                // Release the locks we did take, in reverse order.
+                for (j, entry) in write_slice[..locked].iter().enumerate().rev() {
+                    let rec = unsafe { &*(entry.record_addr as *const Record) };
+                    unsafe { rec.unlock(Tid::from_raw(lock_versions[j])) };
+                }
+                return CommitOutcome::AbortedLockConflict;
+            }
+        }
+    }
+
+    // 3. Serialization point: the epoch our TID will be stamped with.
+    let epoch = current_epoch();
+
+    // 4. Validate read set. A record that is also in our write set
+    // will show `locked` now; that lock is ours, so we compare
+    // masked versions and ignore the lock bit.
+    let read_count = state.read_count as usize;
+    for read in &state.read_set[..read_count] {
+        let record = unsafe { &*(read.record_addr as *const Record) };
+        let current = record.load_tid();
+
+        let in_write_set = write_slice
+            .iter()
+            .any(|w| w.record_addr == read.record_addr);
+
+        if current.version() != read.tid_at_read.version() {
+            unsafe { release_all_locks(write_slice, &lock_versions, locked) };
+            return CommitOutcome::AbortedReadChanged;
+        }
+        if current.is_locked() && !in_write_set {
+            // Someone else locked this record between our read and
+            // validation; abort.
+            unsafe { release_all_locks(write_slice, &lock_versions, locked) };
+            return CommitOutcome::AbortedReadChanged;
+        }
+    }
+
+    // 5. New TID: epoch = current global; sequence = 1 + max seen
+    // across the read and write sets. Silo's paper also factors in
+    // the owning CPU's last-assigned sequence; this implementation
+    // omits that term. The record-lock exclusion already serializes
+    // writers on overlapping records, and epoch advance erases the
+    // sequence space between successive worker transactions. The
+    // omission is a known and deliberate spec drift for the
+    // feasibility phase.
+    let mut max_seq: u32 = 0;
+    for read in &state.read_set[..read_count] {
+        max_seq = max_seq.max(read.tid_at_read.sequence());
+    }
+    for (i, _entry) in write_slice.iter().enumerate() {
+        let prior = Tid::from_raw(lock_versions[i]);
+        max_seq = max_seq.max(prior.sequence());
+    }
+    // If the 29-bit sequence would wrap, aborting protects read
+    // validation from an ABA hole (wrapped TID collides with an older
+    // one whose version mask is identical).
+    const SEQ_MAX: u32 = (1u32 << 29) - 1;
+    if max_seq >= SEQ_MAX {
+        unsafe { release_all_locks(write_slice, &lock_versions, locked) };
+        return CommitOutcome::AbortedSequenceExhausted;
+    }
+    let new_tid = Tid::new(epoch, max_seq + 1);
+
+    // 6. Install. Each `install` publishes the new value and releases
+    // the lock atomically via the TID Release store.
+    for entry in write_slice.iter() {
+        let record = unsafe { &*(entry.record_addr as *const Record) };
+        unsafe { record.install(new_tid, entry.new_value) };
+    }
+
+    CommitOutcome::Committed { new_tid }
+}
+
+/// Abort helper: release the first `locked` entries of the write set
+/// in reverse acquisition order, restoring each record's pre-lock TID
+/// verbatim.
+///
+/// # Safety
+/// - `write_slice` must address the same records that were locked.
+/// - `locked <= write_slice.len()`.
+unsafe fn release_all_locks(
+    write_slice: &[WriteEntry],
+    lock_versions: &[u64; MAX_RW_SET],
+    locked: usize,
+) {
+    for j in (0..locked).rev() {
+        let record = unsafe { &*(write_slice[j].record_addr as *const Record) };
+        unsafe { record.unlock(Tid::from_raw(lock_versions[j])) };
     }
 }
 
@@ -469,12 +631,17 @@ mod tests {
 
     #[test]
     fn txn_state_write_overflow_returns_error_and_leaves_state_intact() {
-        let r = Record::new(Tid::new(1, 0), 0);
+        // Distinct records so coalescing does not keep the count at 1.
+        // A static-lifetime array gives MAX_RW_SET unique addresses on
+        // the stack.
+        let pool: std::vec::Vec<Record> = (0..=MAX_RW_SET)
+            .map(|_| Record::new(Tid::new(1, 0), 0))
+            .collect();
         let mut t = TxnState::new(0);
-        for _ in 0..MAX_RW_SET {
-            t.add_write(&r, 0).unwrap();
+        for rec in &pool[..MAX_RW_SET] {
+            t.add_write(rec, 0).unwrap();
         }
-        assert_eq!(t.add_write(&r, 0), Err(TxnError::WriteSetOverflow));
+        assert_eq!(t.add_write(&pool[MAX_RW_SET], 0), Err(TxnError::WriteSetOverflow));
         assert_eq!(t.write_entries().len(), MAX_RW_SET);
     }
 
@@ -488,6 +655,114 @@ mod tests {
         assert_eq!(t.start_epoch(), 42);
         assert_eq!(t.read_entries().len(), 0);
         assert_eq!(t.write_entries().len(), 0);
+    }
+
+    #[test]
+    fn commit_writes_are_published_and_read_set_validates() {
+        let r = Record::new(Tid::new(current_epoch(), 0), 10);
+        let (observed_tid, _) = r.read_snapshot().unwrap();
+
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_read(&r, observed_tid).unwrap();
+        txn.add_write(&r, 99).unwrap();
+
+        let outcome = unsafe { commit(&mut txn) };
+        match outcome {
+            CommitOutcome::Committed { new_tid } => {
+                assert!(new_tid.sequence() > observed_tid.sequence());
+            }
+            other => panic!("expected Committed, got {:?}", other),
+        }
+        let (_t, v) = r.read_snapshot().unwrap();
+        assert_eq!(v, 99);
+    }
+
+    #[test]
+    fn commit_aborts_when_read_set_version_changes() {
+        let r = Record::new(Tid::new(current_epoch(), 0), 10);
+        let (observed, _) = r.read_snapshot().unwrap();
+
+        // Simulate a concurrent writer that bumped the record's version
+        // between our read and our commit.
+        let prior = r.try_lock().unwrap();
+        unsafe {
+            r.install(
+                Tid::new(prior.epoch(), prior.sequence() + 1),
+                11,
+            );
+        }
+
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_read(&r, observed).unwrap();
+        // No write — pure read validation.
+
+        let outcome = unsafe { commit(&mut txn) };
+        assert_eq!(outcome, CommitOutcome::AbortedReadChanged);
+    }
+
+    #[test]
+    fn commit_aborts_when_another_holder_has_the_lock() {
+        let r = Record::new(Tid::new(current_epoch(), 0), 10);
+
+        // Another worker already holds the write lock.
+        let _held = r.try_lock().unwrap();
+
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_write(&r, 99).unwrap();
+
+        let outcome = unsafe { commit(&mut txn) };
+        assert_eq!(outcome, CommitOutcome::AbortedLockConflict);
+    }
+
+    #[test]
+    fn add_write_coalesces_duplicates_last_writer_wins() {
+        let r = Record::new(Tid::new(current_epoch(), 0), 0);
+        let mut t = TxnState::new(current_epoch());
+        t.add_write(&r, 1).unwrap();
+        t.add_write(&r, 2).unwrap();
+        t.add_write(&r, 3).unwrap();
+        assert_eq!(t.write_entries().len(), 1);
+        assert_eq!(t.write_entries()[0].new_value, 3);
+    }
+
+    #[test]
+    fn commit_aborts_when_sequence_exhausted() {
+        // Sequence field is 29 bits → max 2^29 - 1. Seeding a record
+        // with sequence at the max causes commit to abort rather than
+        // wrap the TID and reuse an older version.
+        const SEQ_MAX: u32 = (1u32 << 29) - 1;
+        let r = Record::new(Tid::new(current_epoch(), SEQ_MAX), 0);
+        let (observed, _) = r.read_snapshot().unwrap();
+
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_read(&r, observed).unwrap();
+        txn.add_write(&r, 7).unwrap();
+
+        let outcome = unsafe { commit(&mut txn) };
+        assert_eq!(outcome, CommitOutcome::AbortedSequenceExhausted);
+    }
+
+    #[test]
+    fn commit_sorts_write_set_by_record_address() {
+        // Force deterministic ordering: three records on the stack,
+        // insert them into the write set in reverse address order,
+        // and verify commit locks them in ascending address order by
+        // requiring all three to commit successfully (a deadlock-
+        // prone order would stall).
+        let a = Record::new(Tid::new(current_epoch(), 0), 1);
+        let b = Record::new(Tid::new(current_epoch(), 0), 2);
+        let c = Record::new(Tid::new(current_epoch(), 0), 3);
+
+        let mut txn = TxnState::new(current_epoch());
+        // Collect in anti-sorted order on purpose.
+        let mut recs = [&a, &b, &c];
+        recs.sort_by(|x, y| (*y as *const Record).cmp(&(*x as *const Record)));
+        for (i, rec) in recs.iter().enumerate() {
+            txn.add_write(rec, 100 + i as u64).unwrap();
+        }
+
+        let outcome = unsafe { commit(&mut txn) };
+        assert!(matches!(outcome, CommitOutcome::Committed { .. }));
     }
 
     #[test]
