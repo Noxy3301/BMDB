@@ -14,9 +14,9 @@
 //! with keys `k_0..k_{n-1}` and children `c_0..c_n`, every key in `c_i` is
 //! strictly less than `k_i`, and every key in `c_{i+1}` is at least `k_i`.
 //!
-//! Supported operations: `insert`, `lookup`, `delete`. No range scan, no
-//! concurrency. The node pool is a static array; allocation uses a bump
-//! pointer with a free list of nodes freed by merges during delete, so
+//! Supported operations: `insert`, `upsert`, `lookup`, `delete`. No range
+//! scan, no concurrency. The node pool is a static array; allocation uses a
+//! bump pointer with a free list of nodes freed by merges during delete, so
 //! delete-then-insert traffic does not leak capacity.
 
 use core::fmt;
@@ -171,6 +171,57 @@ impl BpTree {
             self.root = new_root_id;
         }
         Ok(())
+    }
+
+    /// Insert `key` if absent, overwrite its value if present. Returns
+    /// `Ok(None)` for a fresh insert and `Ok(Some(old))` when an existing
+    /// value was replaced. Fails with `NodePoolExhausted` only on the new-key
+    /// path; an in-place overwrite allocates nothing and succeeds even when
+    /// the pool is otherwise full.
+    pub fn upsert(&mut self, key: Key, value: Value) -> Result<Option<Value>, InsertError> {
+        // Fast path: existing key is rewritten in place. Internal separators
+        // are never touched because the leaf's stored key does not change —
+        // only its associated value.
+        if let Some(leaf_id) = self.find_leaf_id(key) {
+            let leaf = &mut self.pool[leaf_id as usize];
+            let n = leaf.n_keys as usize;
+            let mut i = 0;
+            while i < n && leaf.keys[i] < key {
+                i += 1;
+            }
+            if i < n && leaf.keys[i] == key {
+                let old = leaf.values[i];
+                leaf.values[i] = value;
+                return Ok(Some(old));
+            }
+        }
+        // New key: fall through to the normal insert path (capacity check,
+        // split propagation, possible new root).
+        self.insert(key, value)?;
+        Ok(None)
+    }
+
+    /// Descend to the leaf that would contain `key` if it were present.
+    /// Returns `None` only for an empty tree.
+    fn find_leaf_id(&self, key: Key) -> Option<NodeId> {
+        if self.root == NULL_NODE {
+            return None;
+        }
+        let mut node_id = self.root;
+        loop {
+            let node = &self.pool[node_id as usize];
+            match node.kind {
+                NodeKind::Leaf => return Some(node_id),
+                NodeKind::Internal => {
+                    let n = node.n_keys as usize;
+                    let mut i = 0;
+                    while i < n && node.keys[i] <= key {
+                        i += 1;
+                    }
+                    node_id = node.children[i];
+                }
+            }
+        }
     }
 
     pub fn lookup(&self, key: Key) -> Option<Value> {
@@ -822,6 +873,174 @@ mod tests {
         }
         assert_eq!(tree.height(), 2, "first split should make root internal");
         assert_eq!(tree.num_nodes(), 3, "root + left leaf + right leaf");
+    }
+
+    #[test]
+    fn upsert_on_empty_tree_inserts() {
+        let mut tree = BpTree::new();
+        assert_eq!(tree.upsert(k(1), v(1)), Ok(None));
+        assert_eq!(tree.lookup(k(1)), Some(v(1)));
+        assert_eq!(tree.num_nodes(), 1);
+    }
+
+    #[test]
+    fn upsert_new_key_returns_none() {
+        let mut tree = BpTree::new();
+        tree.insert(k(1), v(1)).unwrap();
+        assert_eq!(tree.upsert(k(2), v(2)), Ok(None));
+        assert_eq!(tree.lookup(k(2)), Some(v(2)));
+    }
+
+    #[test]
+    fn upsert_existing_key_replaces_in_place() {
+        let mut tree = BpTree::new();
+        tree.insert(k(5), v(5)).unwrap();
+        let nodes_before = tree.num_nodes();
+
+        assert_eq!(tree.upsert(k(5), v(99)), Ok(Some(v(5))));
+        assert_eq!(tree.lookup(k(5)), Some(v(99)));
+        // Replacement must not allocate — it is a pure in-place write.
+        assert_eq!(tree.num_nodes(), nodes_before);
+    }
+
+    #[test]
+    fn upsert_many_overwrites_each_key_across_splits() {
+        let mut tree = BpTree::new();
+        // 30 inserts guarantee at least one split, so the replacement path
+        // has to descend through an internal node.
+        for i in 1..=30u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let nodes_before = tree.num_nodes();
+        assert!(tree.height() >= 2);
+
+        for i in 1..=30u64 {
+            assert_eq!(tree.upsert(k(i), v(i * 2)), Ok(Some(v(i))));
+        }
+        // All 30 replacements, zero allocations.
+        assert_eq!(tree.num_nodes(), nodes_before);
+        for i in 1..=30u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i * 2)));
+        }
+    }
+
+    #[test]
+    fn upsert_replace_succeeds_when_pool_full() {
+        // Fill the pool via inserts, then overwrite an existing key. The
+        // replacement allocates nothing, so an exhausted pool must not
+        // block it.
+        let mut tree = BpTree::new();
+        for i in 1..=10_000u64 {
+            if tree.insert(k(i), v(i)).is_err() {
+                break;
+            }
+        }
+        assert_eq!(tree.upsert(k(1), v(777)), Ok(Some(v(1))));
+        assert_eq!(tree.lookup(k(1)), Some(v(777)));
+    }
+
+    #[test]
+    fn upsert_replaces_key_that_equals_internal_separator() {
+        // With ORDER=16, 16 sequential inserts produce an internal root
+        // whose sole separator is k(9). Upserting k(9) must descend past
+        // the separator (go-right-on-equal) and rewrite the leaf value,
+        // not the separator.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let nodes_before = tree.num_nodes();
+        assert_eq!(tree.upsert(k(9), v(900)), Ok(Some(v(9))));
+        assert_eq!(tree.lookup(k(9)), Some(v(900)));
+        assert_eq!(tree.num_nodes(), nodes_before);
+        // Other keys untouched.
+        for i in [1u64, 8, 10, 16] {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)));
+        }
+    }
+
+    #[test]
+    fn upsert_after_delete_reinserts_through_stale_separator() {
+        // Delete a key that equals an internal separator, then upsert it
+        // back. The separator is left stale by the delete (a leaf delete
+        // never rewrites ancestor separators); the upsert miss path must
+        // still route correctly through the stale routing and land the
+        // new entry in the right leaf.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert_eq!(tree.delete(k(9)), Some(v(9)));
+        assert_eq!(tree.lookup(k(9)), None);
+
+        assert_eq!(tree.upsert(k(9), v(900)), Ok(None));
+        assert_eq!(tree.lookup(k(9)), Some(v(900)));
+        for i in (1..=16u64).filter(|&i| i != 9) {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)));
+        }
+    }
+
+    #[test]
+    fn upsert_after_root_collapse_finds_live_leaf_only() {
+        // Force a delete-driven merge + root collapse so that two nodes
+        // end up on the free list. A subsequent upsert on a surviving key
+        // must traverse only live children; if it accidentally followed a
+        // stale child pointer into a freed node it could read garbage.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        // Collapses to a single leaf (see delete_triggers_leaf_merge_and_root_collapse).
+        assert_eq!(tree.delete(k(1)), Some(v(1)));
+        assert_eq!(tree.delete(k(2)), Some(v(2)));
+        assert_eq!(tree.delete(k(3)), Some(v(3)));
+        assert_eq!(tree.height(), 1);
+
+        assert_eq!(tree.upsert(k(10), v(1010)), Ok(Some(v(10))));
+        assert_eq!(tree.lookup(k(10)), Some(v(1010)));
+    }
+
+    #[test]
+    fn upsert_on_single_leaf_root_after_collapse() {
+        // After a root collapse the root is a leaf again. Verify the
+        // leaf-root replacement path works in this post-structural-change
+        // state, not only in the freshly-created single-leaf state tested
+        // by `upsert_on_empty_tree_inserts`.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert_eq!(tree.delete(k(1)), Some(v(1)));
+        assert_eq!(tree.delete(k(2)), Some(v(2)));
+        assert_eq!(tree.delete(k(3)), Some(v(3)));
+        // Now the tree is a single leaf containing {4..=16}.
+        assert_eq!(tree.height(), 1);
+
+        assert_eq!(tree.upsert(k(8), v(888)), Ok(Some(v(8))));
+        assert_eq!(tree.lookup(k(8)), Some(v(888)));
+        // Insert a brand-new key on the single-leaf root as well.
+        assert_eq!(tree.upsert(k(100), v(100)), Ok(None));
+        assert_eq!(tree.lookup(k(100)), Some(v(100)));
+    }
+
+    #[test]
+    fn upsert_new_key_on_full_pool_fails() {
+        let mut tree = BpTree::new();
+        let mut last_inserted = 0u64;
+        for i in 1..=10_000u64 {
+            match tree.insert(k(i), v(i)) {
+                Ok(()) => last_inserted = i,
+                Err(InsertError::NodePoolExhausted) => break,
+                Err(e) => panic!("unexpected: {:?}", e),
+            }
+        }
+        // The next unused key has no reserved slot; upsert falls through to
+        // insert, which rejects on capacity.
+        let new_key = last_inserted + 1;
+        assert_eq!(
+            tree.upsert(k(new_key), v(0)),
+            Err(InsertError::NodePoolExhausted)
+        );
     }
 
     #[test]
