@@ -14,9 +14,10 @@
 //! with keys `k_0..k_{n-1}` and children `c_0..c_n`, every key in `c_i` is
 //! strictly less than `k_i`, and every key in `c_{i+1}` is at least `k_i`.
 //!
-//! Scope for Phase 3: `insert` + `lookup`. No delete, no range scan, no
-//! concurrency. A static node pool + bump allocator stands in for a real
-//! allocator; no nodes are reclaimed yet.
+//! Supported operations: `insert`, `lookup`, `delete`. No range scan, no
+//! concurrency. The node pool is a static array; allocation uses a bump
+//! pointer with a free list of nodes freed by merges during delete, so
+//! delete-then-insert traffic does not leak capacity.
 
 use core::fmt;
 
@@ -33,6 +34,13 @@ const MAX_KEYS: usize = ORDER - 1;
 // overflow by one before it is split.
 const KEY_SLOTS: usize = MAX_KEYS + 1;
 const CHILD_SLOTS: usize = ORDER + 1;
+
+// Minimum fill for a non-root node. Leaves and internal nodes both use
+// MAX_KEYS / 2 so that any two sibling nodes at the minimum can be merged
+// into a single node without overflow: 2 * MIN <= MAX_KEYS, and for internal
+// merges 2 * MIN + 1 (the pulled-down separator) <= MAX_KEYS still holds.
+const MIN_LEAF_KEYS: usize = MAX_KEYS / 2;
+const MIN_INTERNAL_KEYS: usize = MAX_KEYS / 2;
 
 /// How many nodes the static pool holds. 64 * size_of::<Node>() fits on the
 /// kernel stack with room to spare.
@@ -77,7 +85,15 @@ pub enum InsertError {
 
 pub struct BpTree {
     pool: [Node; POOL_SIZE],
+    // Bump allocator: next slot that has never been handed out. Monotonic.
     next_free_idx: u32,
+    // Head of the free list, threaded through each freed node's `next_leaf`
+    // field (unused for non-leaves, harmless to overwrite for leaves since
+    // a freed leaf is no longer part of the leaf chain). NULL_NODE when empty.
+    free_head: NodeId,
+    // Number of nodes currently on the free list. `next_free_idx - free_count`
+    // is the live node count.
+    free_count: u32,
     root: NodeId,
 }
 
@@ -86,14 +102,16 @@ impl BpTree {
         Self {
             pool: [EMPTY_NODE; POOL_SIZE],
             next_free_idx: 0,
+            free_head: NULL_NODE,
+            free_count: 0,
             root: NULL_NODE,
         }
     }
 
-    /// Number of node slots consumed so far. No reclamation yet, so this is
-    /// also the peak.
+    /// Live node count — slots consumed by the bump allocator minus slots
+    /// currently on the free list. Decreases as merges free nodes.
     pub fn num_nodes(&self) -> u32 {
-        self.next_free_idx
+        self.next_free_idx - self.free_count
     }
 
     /// Height from root to any leaf. Returns 0 for an empty tree, 1 when the
@@ -126,7 +144,7 @@ impl BpTree {
         } else {
             self.height() + 1
         };
-        let available = (POOL_SIZE as u32).saturating_sub(self.next_free_idx);
+        let available = (POOL_SIZE as u32).saturating_sub(self.num_nodes());
         if available < required {
             return Err(InsertError::NodePoolExhausted);
         }
@@ -350,19 +368,357 @@ impl BpTree {
         Ok((sep, right_id))
     }
 
-    fn alloc_node(&mut self, kind: NodeKind) -> Result<NodeId, InsertError> {
-        if self.next_free_idx as usize >= POOL_SIZE {
-            return Err(InsertError::NodePoolExhausted);
+    /// Remove `key` from the tree. Returns the value that was stored, or
+    /// `None` if the key was not present. Cannot fail: delete only frees
+    /// nodes, it never allocates.
+    ///
+    /// Rebalancing follows the canonical B+tree rules (Comer 1979, Jannink
+    /// 1995): on leaf underflow try to borrow from a sibling, otherwise
+    /// merge with a sibling and propagate upward. Separator keys in
+    /// ancestors are only rewritten by borrow/merge — a plain leaf delete
+    /// leaves the routing layer untouched, even if the deleted key happens
+    /// to equal an ancestor separator (Graefe, "Modern B-Tree Techniques").
+    pub fn delete(&mut self, key: Key) -> Option<Value> {
+        if self.root == NULL_NODE {
+            return None;
         }
-        let id = self.next_free_idx;
-        self.next_free_idx += 1;
-        // The pool is pre-zeroed in `new()`; only the fields that vary per
-        // node need to be reset.
+        let (value, _) = self.delete_rec(self.root, key);
+
+        // Root collapse: an internal root left with a single child after a
+        // child-level merge has no keys of its own. Promote the child.
+        let root_kind = self.pool[self.root as usize].kind;
+        let root_n = self.pool[self.root as usize].n_keys;
+        if root_kind == NodeKind::Internal && root_n == 0 {
+            let old_root = self.root;
+            self.root = self.pool[old_root as usize].children[0];
+            self.free_node(old_root);
+        } else if root_kind == NodeKind::Leaf && root_n == 0 {
+            let old_root = self.root;
+            self.free_node(old_root);
+            self.root = NULL_NODE;
+        }
+        value
+    }
+
+    /// Returns `(value_if_found, whether_this_node_now_underflows)`. The
+    /// underflow flag is what the caller checks to decide whether to
+    /// rebalance this node as one of its own children.
+    fn delete_rec(&mut self, node_id: NodeId, key: Key) -> (Option<Value>, bool) {
+        let kind = self.pool[node_id as usize].kind;
+        match kind {
+            NodeKind::Leaf => self.delete_from_leaf(node_id, key),
+            NodeKind::Internal => self.delete_from_internal(node_id, key),
+        }
+    }
+
+    fn delete_from_leaf(&mut self, leaf_id: NodeId, key: Key) -> (Option<Value>, bool) {
+        let leaf = &mut self.pool[leaf_id as usize];
+        let n = leaf.n_keys as usize;
+
+        let mut i = 0;
+        while i < n && leaf.keys[i] < key {
+            i += 1;
+        }
+        if i >= n || leaf.keys[i] != key {
+            return (None, false);
+        }
+
+        let value = leaf.values[i];
+        let mut j = i;
+        while j + 1 < n {
+            leaf.keys[j] = leaf.keys[j + 1];
+            leaf.values[j] = leaf.values[j + 1];
+            j += 1;
+        }
+        leaf.n_keys -= 1;
+
+        let underflow = (leaf.n_keys as usize) < MIN_LEAF_KEYS;
+        (Some(value), underflow)
+    }
+
+    fn delete_from_internal(&mut self, node_id: NodeId, key: Key) -> (Option<Value>, bool) {
+        // Descent rule matches lookup: on `key == separator`, go right. This
+        // keeps delete consistent with the half-open `[k_{i-1}, k_i)`
+        // convention used everywhere else.
+        let child_idx = {
+            let node = &self.pool[node_id as usize];
+            let n = node.n_keys as usize;
+            let mut i = 0;
+            while i < n && node.keys[i] <= key {
+                i += 1;
+            }
+            i
+        };
+        let child_id = self.pool[node_id as usize].children[child_idx];
+        let (value, child_underflow) = self.delete_rec(child_id, key);
+
+        if child_underflow {
+            self.rebalance_child(node_id, child_idx);
+        }
+
+        let underflow = (self.pool[node_id as usize].n_keys as usize) < MIN_INTERNAL_KEYS;
+        (value, underflow)
+    }
+
+    /// Restore the fill invariant for `children[child_idx]` of `parent_id`.
+    /// Prefers borrowing from a sibling (cheaper — one node touched beyond
+    /// the underflowing one); falls back to a merge (frees one node,
+    /// shrinks the parent by one entry).
+    fn rebalance_child(&mut self, parent_id: NodeId, child_idx: usize) {
+        let parent_n = self.pool[parent_id as usize].n_keys as usize;
+        let child_id = self.pool[parent_id as usize].children[child_idx];
+        let child_is_leaf = self.pool[child_id as usize].kind == NodeKind::Leaf;
+        let min = if child_is_leaf { MIN_LEAF_KEYS } else { MIN_INTERNAL_KEYS };
+
+        if child_idx > 0 {
+            let left_id = self.pool[parent_id as usize].children[child_idx - 1];
+            if (self.pool[left_id as usize].n_keys as usize) > min {
+                self.borrow_from_left(parent_id, child_idx);
+                return;
+            }
+        }
+        if child_idx < parent_n {
+            let right_id = self.pool[parent_id as usize].children[child_idx + 1];
+            if (self.pool[right_id as usize].n_keys as usize) > min {
+                self.borrow_from_right(parent_id, child_idx);
+                return;
+            }
+        }
+
+        // No sibling has slack: merge. Always merge the right sibling into
+        // the left, so the freed node is the right one. If the underflowing
+        // child has no left sibling, it becomes the left of the merge pair.
+        if child_idx > 0 {
+            self.merge_children(parent_id, child_idx - 1);
+        } else {
+            self.merge_children(parent_id, child_idx);
+        }
+    }
+
+    /// Move one entry from the left sibling to the front of `children[child_idx]`.
+    /// Updates the parent separator to the new first key of the right child.
+    fn borrow_from_left(&mut self, parent_id: NodeId, child_idx: usize) {
+        let left_id = self.pool[parent_id as usize].children[child_idx - 1];
+        let right_id = self.pool[parent_id as usize].children[child_idx];
+        let right_kind = self.pool[right_id as usize].kind;
+
+        match right_kind {
+            NodeKind::Leaf => {
+                let left_n = self.pool[left_id as usize].n_keys as usize;
+                let right_n = self.pool[right_id as usize].n_keys as usize;
+                let borrowed_key = self.pool[left_id as usize].keys[left_n - 1];
+                let borrowed_val = self.pool[left_id as usize].values[left_n - 1];
+
+                // Shift right-child entries one slot right to open index 0.
+                let right = &mut self.pool[right_id as usize];
+                let mut j = right_n;
+                while j > 0 {
+                    right.keys[j] = right.keys[j - 1];
+                    right.values[j] = right.values[j - 1];
+                    j -= 1;
+                }
+                right.keys[0] = borrowed_key;
+                right.values[0] = borrowed_val;
+                right.n_keys += 1;
+
+                self.pool[left_id as usize].n_keys -= 1;
+
+                // New separator is the new first key of the right child.
+                self.pool[parent_id as usize].keys[child_idx - 1] = borrowed_key;
+            }
+            NodeKind::Internal => {
+                // Rotate through the parent: parent_sep moves down to the
+                // front of the right child, and the left child's last key
+                // moves up to become the new separator.
+                let left_n = self.pool[left_id as usize].n_keys as usize;
+                let right_n = self.pool[right_id as usize].n_keys as usize;
+                let parent_sep = self.pool[parent_id as usize].keys[child_idx - 1];
+                let new_sep = self.pool[left_id as usize].keys[left_n - 1];
+                let moved_child = self.pool[left_id as usize].children[left_n];
+
+                // Shift right's keys/children right by one to make room at 0.
+                let right = &mut self.pool[right_id as usize];
+                let mut j = right_n;
+                while j > 0 {
+                    right.keys[j] = right.keys[j - 1];
+                    j -= 1;
+                }
+                let mut j = right_n + 1;
+                while j > 0 {
+                    right.children[j] = right.children[j - 1];
+                    j -= 1;
+                }
+                right.keys[0] = parent_sep;
+                right.children[0] = moved_child;
+                right.n_keys += 1;
+
+                self.pool[left_id as usize].n_keys -= 1;
+                self.pool[parent_id as usize].keys[child_idx - 1] = new_sep;
+            }
+        }
+    }
+
+    /// Move one entry from the right sibling to the end of `children[child_idx]`.
+    /// Updates the parent separator to the new first key of the right sibling.
+    fn borrow_from_right(&mut self, parent_id: NodeId, child_idx: usize) {
+        let left_id = self.pool[parent_id as usize].children[child_idx];
+        let right_id = self.pool[parent_id as usize].children[child_idx + 1];
+        let right_kind = self.pool[right_id as usize].kind;
+
+        match right_kind {
+            NodeKind::Leaf => {
+                let left_n = self.pool[left_id as usize].n_keys as usize;
+                let right_n = self.pool[right_id as usize].n_keys as usize;
+                let borrowed_key = self.pool[right_id as usize].keys[0];
+                let borrowed_val = self.pool[right_id as usize].values[0];
+
+                self.pool[left_id as usize].keys[left_n] = borrowed_key;
+                self.pool[left_id as usize].values[left_n] = borrowed_val;
+                self.pool[left_id as usize].n_keys += 1;
+
+                // Shift right-child entries one slot left.
+                let right = &mut self.pool[right_id as usize];
+                let mut j = 0;
+                while j + 1 < right_n {
+                    right.keys[j] = right.keys[j + 1];
+                    right.values[j] = right.values[j + 1];
+                    j += 1;
+                }
+                right.n_keys -= 1;
+
+                // New separator is the new first key of the right child.
+                let new_sep = self.pool[right_id as usize].keys[0];
+                self.pool[parent_id as usize].keys[child_idx] = new_sep;
+            }
+            NodeKind::Internal => {
+                // Rotate through the parent: parent_sep moves down to the
+                // end of the left child, and the right child's first key
+                // moves up to become the new separator.
+                let left_n = self.pool[left_id as usize].n_keys as usize;
+                let right_n = self.pool[right_id as usize].n_keys as usize;
+                let parent_sep = self.pool[parent_id as usize].keys[child_idx];
+                let new_sep = self.pool[right_id as usize].keys[0];
+                let moved_child = self.pool[right_id as usize].children[0];
+
+                let left = &mut self.pool[left_id as usize];
+                left.keys[left_n] = parent_sep;
+                left.children[left_n + 1] = moved_child;
+                left.n_keys += 1;
+
+                // Shift right's keys/children left by one.
+                let right = &mut self.pool[right_id as usize];
+                let mut j = 0;
+                while j + 1 < right_n {
+                    right.keys[j] = right.keys[j + 1];
+                    j += 1;
+                }
+                let mut j = 0;
+                while j + 1 <= right_n {
+                    right.children[j] = right.children[j + 1];
+                    j += 1;
+                }
+                right.n_keys -= 1;
+
+                self.pool[parent_id as usize].keys[child_idx] = new_sep;
+            }
+        }
+    }
+
+    /// Merge `children[left_idx + 1]` into `children[left_idx]`. The freed
+    /// right sibling is returned to the free list. The parent loses one
+    /// separator and one child pointer.
+    fn merge_children(&mut self, parent_id: NodeId, left_idx: usize) {
+        let left_id = self.pool[parent_id as usize].children[left_idx];
+        let right_id = self.pool[parent_id as usize].children[left_idx + 1];
+        let kind = self.pool[left_id as usize].kind;
+
+        match kind {
+            NodeKind::Leaf => {
+                let left_n = self.pool[left_id as usize].n_keys as usize;
+                let right_n = self.pool[right_id as usize].n_keys as usize;
+
+                for j in 0..right_n {
+                    let k = self.pool[right_id as usize].keys[j];
+                    let v = self.pool[right_id as usize].values[j];
+                    self.pool[left_id as usize].keys[left_n + j] = k;
+                    self.pool[left_id as usize].values[left_n + j] = v;
+                }
+                self.pool[left_id as usize].n_keys = (left_n + right_n) as u16;
+                // Splice the absorbed leaf out of the forward chain.
+                self.pool[left_id as usize].next_leaf =
+                    self.pool[right_id as usize].next_leaf;
+            }
+            NodeKind::Internal => {
+                // Pull the separator between the two siblings down into the
+                // merged node: internal merge is (left) + (sep) + (right).
+                let left_n = self.pool[left_id as usize].n_keys as usize;
+                let right_n = self.pool[right_id as usize].n_keys as usize;
+                let sep = self.pool[parent_id as usize].keys[left_idx];
+
+                self.pool[left_id as usize].keys[left_n] = sep;
+                for j in 0..right_n {
+                    let k = self.pool[right_id as usize].keys[j];
+                    self.pool[left_id as usize].keys[left_n + 1 + j] = k;
+                }
+                for j in 0..=right_n {
+                    let c = self.pool[right_id as usize].children[j];
+                    self.pool[left_id as usize].children[left_n + 1 + j] = c;
+                }
+                self.pool[left_id as usize].n_keys = (left_n + 1 + right_n) as u16;
+            }
+        }
+
+        // Remove parent separator at left_idx and child pointer at left_idx + 1.
+        let parent = &mut self.pool[parent_id as usize];
+        let p_n = parent.n_keys as usize;
+        let mut j = left_idx;
+        while j + 1 < p_n {
+            parent.keys[j] = parent.keys[j + 1];
+            j += 1;
+        }
+        let mut j = left_idx + 1;
+        while j < p_n {
+            parent.children[j] = parent.children[j + 1];
+            j += 1;
+        }
+        parent.n_keys -= 1;
+
+        self.free_node(right_id);
+    }
+
+    fn alloc_node(&mut self, kind: NodeKind) -> Result<NodeId, InsertError> {
+        // Prefer the free list: reusing a merge-freed slot keeps the bump
+        // pointer from walking off the end of the pool under steady-state
+        // delete/insert churn.
+        let id = if self.free_head != NULL_NODE {
+            let id = self.free_head;
+            self.free_head = self.pool[id as usize].next_leaf;
+            self.free_count -= 1;
+            id
+        } else {
+            if self.next_free_idx as usize >= POOL_SIZE {
+                return Err(InsertError::NodePoolExhausted);
+            }
+            let id = self.next_free_idx;
+            self.next_free_idx += 1;
+            id
+        };
+        // Reset per-node state. keys/values/children retain stale bytes from
+        // the previous tenant, but they are never read before being
+        // overwritten — n_keys = 0 gates all of them.
         let node = &mut self.pool[id as usize];
         node.kind = kind;
         node.n_keys = 0;
         node.next_leaf = NULL_NODE;
         Ok(id)
+    }
+
+    fn free_node(&mut self, id: NodeId) {
+        let node = &mut self.pool[id as usize];
+        node.n_keys = 0;
+        node.next_leaf = self.free_head;
+        self.free_head = id;
+        self.free_count += 1;
     }
 }
 
@@ -466,6 +822,229 @@ mod tests {
         }
         assert_eq!(tree.height(), 2, "first split should make root internal");
         assert_eq!(tree.num_nodes(), 3, "root + left leaf + right leaf");
+    }
+
+    #[test]
+    fn delete_from_empty_tree_returns_none() {
+        let mut tree = BpTree::new();
+        assert_eq!(tree.delete(k(1)), None);
+        assert_eq!(tree.num_nodes(), 0);
+        assert_eq!(tree.height(), 0);
+    }
+
+    #[test]
+    fn delete_nonexistent_key_returns_none_and_keeps_others() {
+        let mut tree = BpTree::new();
+        tree.insert(k(1), v(1)).unwrap();
+        tree.insert(k(3), v(3)).unwrap();
+        assert_eq!(tree.delete(k(2)), None);
+        assert_eq!(tree.lookup(k(1)), Some(v(1)));
+        assert_eq!(tree.lookup(k(3)), Some(v(3)));
+    }
+
+    #[test]
+    fn delete_only_key_empties_tree() {
+        let mut tree = BpTree::new();
+        tree.insert(k(42), v(42)).unwrap();
+        assert_eq!(tree.delete(k(42)), Some(v(42)));
+        assert_eq!(tree.lookup(k(42)), None);
+        assert_eq!(tree.num_nodes(), 0);
+        assert_eq!(tree.height(), 0);
+    }
+
+    #[test]
+    fn delete_without_underflow_preserves_siblings() {
+        // A single leaf above MIN loses one entry; no rebalance needed.
+        let mut tree = BpTree::new();
+        for i in 1..=10u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert_eq!(tree.delete(k(5)), Some(v(5)));
+        assert_eq!(tree.lookup(k(5)), None);
+        for i in [1u64, 2, 3, 4, 6, 7, 8, 9, 10] {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)));
+        }
+    }
+
+    #[test]
+    fn delete_triggers_leaf_borrow_from_right() {
+        // After 16 sequential inserts the tree is one internal root and two
+        // leaves of 8 entries each. Deleting twice from the left leaf drops
+        // it to 6 (< MIN=7), which forces a borrow from the right sibling.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let nodes_before = tree.num_nodes();
+        assert_eq!(tree.delete(k(1)), Some(v(1))); // leaf at MIN, no underflow
+        assert_eq!(tree.delete(k(2)), Some(v(2))); // underflow → borrow
+
+        // Borrow (not merge): the tree shape is unchanged.
+        assert_eq!(tree.num_nodes(), nodes_before);
+        assert_eq!(tree.height(), 2);
+        for i in 3..=16u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)), "lost {} after borrow", i);
+        }
+    }
+
+    #[test]
+    fn delete_triggers_leaf_borrow_from_left() {
+        // Symmetric to borrow_from_right: delete twice from the right leaf
+        // to force it to borrow from its left sibling.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let nodes_before = tree.num_nodes();
+        assert_eq!(tree.delete(k(16)), Some(v(16)));
+        assert_eq!(tree.delete(k(15)), Some(v(15)));
+
+        assert_eq!(tree.num_nodes(), nodes_before);
+        assert_eq!(tree.height(), 2);
+        for i in 1..=14u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)), "lost {} after borrow", i);
+        }
+    }
+
+    #[test]
+    fn delete_triggers_leaf_merge_and_root_collapse() {
+        // 16 inserts → 2 leaves of 8. Two deletes borrow once (both leaves
+        // down to 7). A third delete from the left underflows it to 6; the
+        // right sibling is at MIN so cannot lend — they merge into one leaf
+        // and the internal root, now empty, is collapsed away.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert_eq!(tree.delete(k(1)), Some(v(1)));
+        assert_eq!(tree.delete(k(2)), Some(v(2)));
+        assert_eq!(tree.delete(k(3)), Some(v(3)));
+
+        assert_eq!(tree.height(), 1, "root should collapse to single leaf");
+        assert_eq!(tree.num_nodes(), 1);
+        for i in 4..=16u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)), "lost {} after merge", i);
+        }
+    }
+
+    #[test]
+    fn delete_even_keys_preserves_odd_keys_in_deep_tree() {
+        let mut tree = BpTree::new();
+        for i in 1..=50u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let start_height = tree.height();
+        assert!(start_height >= 2);
+
+        for i in (2..=50u64).step_by(2) {
+            assert_eq!(tree.delete(k(i)), Some(v(i)), "delete({}) failed", i);
+        }
+        for i in (1..=49u64).step_by(2) {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)), "odd {} lost", i);
+        }
+        for i in (2..=50u64).step_by(2) {
+            assert_eq!(tree.lookup(k(i)), None, "phantom even {}", i);
+        }
+    }
+
+    #[test]
+    fn delete_every_key_empties_tree() {
+        let mut tree = BpTree::new();
+        for i in 1..=50u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        for i in 1..=50u64 {
+            assert_eq!(tree.delete(k(i)), Some(v(i)), "delete({}) missing", i);
+        }
+        assert_eq!(tree.num_nodes(), 0);
+        assert_eq!(tree.height(), 0);
+        assert_eq!(tree.lookup(k(1)), None);
+    }
+
+    #[test]
+    fn delete_then_reinsert_reuses_freed_nodes() {
+        // After a merge-driven root collapse, two nodes sit on the free
+        // list. The next three inserts must pull from the free list before
+        // advancing the bump pointer, so the peak node count never exceeds
+        // what the original shape required.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let peak_nodes = tree.num_nodes();
+        assert_eq!(peak_nodes, 3);
+
+        assert_eq!(tree.delete(k(1)), Some(v(1)));
+        assert_eq!(tree.delete(k(2)), Some(v(2)));
+        assert_eq!(tree.delete(k(3)), Some(v(3)));
+        assert_eq!(tree.num_nodes(), 1);
+
+        for i in 1..=3u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        // Adding 3 keys to a single 13-entry leaf overflows it (16 > 15)
+        // and forces one leaf split plus a new internal root — back to the
+        // original 3-node shape.
+        assert_eq!(tree.num_nodes(), peak_nodes);
+        for i in 1..=16u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)));
+        }
+    }
+
+    #[test]
+    fn delete_descends_past_stale_separator() {
+        // When a deleted key equals an internal separator, descent must go
+        // right (half-open routing), and the separator is left stale — the
+        // deletion itself does not rewrite it. A subsequent lookup of the
+        // deleted key must still return None.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        // Internal root's separator is k(9) (first key of the right leaf).
+        assert_eq!(tree.delete(k(9)), Some(v(9)));
+        assert_eq!(tree.lookup(k(9)), None);
+        for i in (1..=16u64).filter(|&i| i != 9) {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)));
+        }
+    }
+
+    #[test]
+    fn delete_exercises_internal_rebalance_in_deep_tree() {
+        // Covers merge/borrow at the internal level — not just the leaf
+        // level. A tree of height >= 3 has at least one non-root internal
+        // node, which is the only kind that can actually underflow (the
+        // root is exempt from MIN). This test forces one by inserting
+        // until the pool fills, then deletes every key and asserts the
+        // pool returns to empty.
+        let mut tree = BpTree::new();
+        let mut last_inserted = 0u64;
+        for i in 1..=2000u64 {
+            match tree.insert(k(i), v(i)) {
+                Ok(()) => last_inserted = i,
+                Err(InsertError::NodePoolExhausted) => break,
+                Err(e) => panic!("unexpected insert error: {:?}", e),
+            }
+        }
+        assert!(
+            tree.height() >= 3,
+            "test needs height >= 3 for internal rebalance, got {}",
+            tree.height()
+        );
+
+        // Delete forward; spot-check mid-run that the tree is still
+        // well-formed by looking up keys that have not yet been deleted.
+        for i in 1..=last_inserted {
+            assert_eq!(tree.delete(k(i)), Some(v(i)), "delete({}) lost", i);
+            if i % 32 == 0 {
+                let probe_end = last_inserted.min(i + 16);
+                for j in (i + 1)..=probe_end {
+                    assert_eq!(tree.lookup(k(j)), Some(v(j)), "lookup({}) after delete({})", j, i);
+                }
+            }
+        }
+        assert_eq!(tree.num_nodes(), 0);
+        assert_eq!(tree.height(), 0);
     }
 
     #[test]
