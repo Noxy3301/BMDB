@@ -216,6 +216,132 @@ impl Record {
     }
 }
 
+// -------------------------------------------------------------------
+// Silo-3: per-transaction read and write sets.
+// -------------------------------------------------------------------
+
+/// Maximum distinct records a single transaction may touch. Bounds the
+/// stack-resident `TxnState` footprint and is a typical Silo parameter
+/// (Masstree ships the same constant). Transactions that exceed this
+/// abort via [`TxnError::ReadSetOverflow`] / [`TxnError::WriteSetOverflow`].
+pub const MAX_RW_SET: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnError {
+    ReadSetOverflow,
+    WriteSetOverflow,
+}
+
+/// One entry of a transaction's read set: the identity of the record
+/// plus the TID observed when the value was read. Validation re-loads
+/// the record's TID and aborts the transaction if the version moved
+/// or the lock bit appeared.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadEntry {
+    /// Record identity as a plain address; the caller guarantees
+    /// pointer validity (records live in a long-lived pool / tree).
+    pub record_addr: usize,
+    pub tid_at_read: Tid,
+}
+
+/// One entry of a transaction's write set: which record to update and
+/// the value to install on commit. The lock/install sequence in the
+/// commit protocol walks this list.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteEntry {
+    pub record_addr: usize,
+    pub new_value: u64,
+}
+
+impl ReadEntry {
+    const EMPTY: Self = Self {
+        record_addr: 0,
+        tid_at_read: Tid::from_raw(0),
+    };
+}
+
+impl WriteEntry {
+    const EMPTY: Self = Self {
+        record_addr: 0,
+        new_value: 0,
+    };
+}
+
+/// Per-transaction scratch state. Sized for the worst case and kept
+/// on the owning CPU (no heap, no cross-CPU sharing); a transaction
+/// owns one `TxnState` throughout its lifetime, then `reset`s it for
+/// the next one.
+pub struct TxnState {
+    start_epoch: u32,
+    read_count: u32,
+    read_set: [ReadEntry; MAX_RW_SET],
+    write_count: u32,
+    write_set: [WriteEntry; MAX_RW_SET],
+}
+
+impl TxnState {
+    pub const fn new(start_epoch: u32) -> Self {
+        Self {
+            start_epoch,
+            read_count: 0,
+            read_set: [ReadEntry::EMPTY; MAX_RW_SET],
+            write_count: 0,
+            write_set: [WriteEntry::EMPTY; MAX_RW_SET],
+        }
+    }
+
+    pub fn start_epoch(&self) -> u32 {
+        self.start_epoch
+    }
+
+    pub fn read_entries(&self) -> &[ReadEntry] {
+        &self.read_set[..self.read_count as usize]
+    }
+
+    pub fn write_entries(&self) -> &[WriteEntry] {
+        &self.write_set[..self.write_count as usize]
+    }
+
+    /// Record a read-set entry. Returns `Err(ReadSetOverflow)` when
+    /// the fixed-size buffer is full; the state is left unchanged on
+    /// that path so the caller can abort cleanly.
+    pub fn add_read(&mut self, record: &Record, tid_at_read: Tid) -> Result<(), TxnError> {
+        if (self.read_count as usize) >= MAX_RW_SET {
+            return Err(TxnError::ReadSetOverflow);
+        }
+        let idx = self.read_count as usize;
+        self.read_set[idx] = ReadEntry {
+            record_addr: record as *const Record as usize,
+            tid_at_read,
+        };
+        self.read_count += 1;
+        Ok(())
+    }
+
+    /// Buffer a write. Actual value publication happens in commit
+    /// (Silo-4's validate + install phase).
+    pub fn add_write(&mut self, record: &Record, new_value: u64) -> Result<(), TxnError> {
+        if (self.write_count as usize) >= MAX_RW_SET {
+            return Err(TxnError::WriteSetOverflow);
+        }
+        let idx = self.write_count as usize;
+        self.write_set[idx] = WriteEntry {
+            record_addr: record as *const Record as usize,
+            new_value,
+        };
+        self.write_count += 1;
+        Ok(())
+    }
+
+    /// Clear both sets and stamp a new start epoch so the instance can
+    /// be reused for the next transaction without reallocating.
+    pub fn reset(&mut self, start_epoch: u32) {
+        self.start_epoch = start_epoch;
+        self.read_count = 0;
+        self.write_count = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +416,78 @@ mod tests {
         let (tid, val) = r.read_snapshot().unwrap();
         assert_eq!(val, 42);
         assert_eq!(tid, prior);
+    }
+
+    #[test]
+    fn txn_state_initial_is_empty() {
+        let t = TxnState::new(7);
+        assert_eq!(t.start_epoch(), 7);
+        assert_eq!(t.read_entries().len(), 0);
+        assert_eq!(t.write_entries().len(), 0);
+    }
+
+    #[test]
+    fn txn_state_records_read_snapshots_in_order() {
+        let r0 = Record::new(Tid::new(1, 0), 10);
+        let r1 = Record::new(Tid::new(2, 0), 20);
+        let mut t = TxnState::new(0);
+        t.add_read(&r0, Tid::new(1, 0)).unwrap();
+        t.add_read(&r1, Tid::new(2, 0)).unwrap();
+        let entries = t.read_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tid_at_read, Tid::new(1, 0));
+        assert_eq!(entries[1].tid_at_read, Tid::new(2, 0));
+        assert_eq!(entries[0].record_addr, &r0 as *const Record as usize);
+        assert_eq!(entries[1].record_addr, &r1 as *const Record as usize);
+    }
+
+    #[test]
+    fn txn_state_buffers_writes_independently_of_reads() {
+        let r0 = Record::new(Tid::new(1, 0), 10);
+        let mut t = TxnState::new(0);
+        t.add_read(&r0, Tid::new(1, 0)).unwrap();
+        t.add_write(&r0, 99).unwrap();
+        assert_eq!(t.read_entries().len(), 1);
+        assert_eq!(t.write_entries().len(), 1);
+        assert_eq!(t.write_entries()[0].new_value, 99);
+    }
+
+    #[test]
+    fn txn_state_read_overflow_returns_error_and_leaves_state_intact() {
+        let r = Record::new(Tid::new(1, 0), 0);
+        let mut t = TxnState::new(0);
+        for _ in 0..MAX_RW_SET {
+            t.add_read(&r, Tid::new(1, 0)).unwrap();
+        }
+        assert_eq!(
+            t.add_read(&r, Tid::new(1, 0)),
+            Err(TxnError::ReadSetOverflow),
+        );
+        // The rejected entry must not have been counted.
+        assert_eq!(t.read_entries().len(), MAX_RW_SET);
+    }
+
+    #[test]
+    fn txn_state_write_overflow_returns_error_and_leaves_state_intact() {
+        let r = Record::new(Tid::new(1, 0), 0);
+        let mut t = TxnState::new(0);
+        for _ in 0..MAX_RW_SET {
+            t.add_write(&r, 0).unwrap();
+        }
+        assert_eq!(t.add_write(&r, 0), Err(TxnError::WriteSetOverflow));
+        assert_eq!(t.write_entries().len(), MAX_RW_SET);
+    }
+
+    #[test]
+    fn txn_state_reset_clears_both_sets_and_updates_start_epoch() {
+        let r = Record::new(Tid::new(1, 0), 0);
+        let mut t = TxnState::new(0);
+        t.add_read(&r, Tid::new(1, 0)).unwrap();
+        t.add_write(&r, 99).unwrap();
+        t.reset(42);
+        assert_eq!(t.start_epoch(), 42);
+        assert_eq!(t.read_entries().len(), 0);
+        assert_eq!(t.write_entries().len(), 0);
     }
 
     #[test]
