@@ -13,6 +13,13 @@
 //! masked values). `LATEST` is reserved for the future multi-version
 //! extension and is unused here; `LOCK` and `ABSENT` are active.
 //!
+//! A single global `GLOBAL_EPOCH` counter supplies the epoch field in
+//! every TID a committing transaction stamps. Its advance mechanism is
+//! decoupled: any loop — timer interrupt, idle CPU, a dedicated epoch
+//! thread — can call [`advance_epoch`] to bump the counter. The
+//! minimum frequency required for group-commit latency targets is on
+//! the order of Silo's 40 ms, but correctness does not depend on it.
+//!
 //! `Record` stores a single 8-byte value alongside the atomic TID.
 //! Both words are true Rust atomics: Silo's read protocol (snapshot
 //! TID → read value → re-snapshot TID) needs the value access to be a
@@ -22,7 +29,42 @@
 //! For 8-byte values that is a natural fit: `AtomicU64` on x86_64 is a
 //! single `mov`. Values larger than 8 bytes are out of scope for now.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Global epoch counter. Starts at 1 so that TID epoch 0 is reserved
+/// for "never committed" records and never returned by
+/// [`advance_epoch`] during normal operation.
+///
+/// Wrap-around: at a 40 ms advance cadence (Silo's default) the 32-bit
+/// counter lasts ~5.4 years of continuous uptime and then wraps back
+/// to `0`, which collides with the reserved "never committed" sentinel.
+/// This feasibility-phase tradeoff is called out deliberately; the
+/// eventual Verus-verified variant should widen the field to `u64` or
+/// clamp explicitly.
+static GLOBAL_EPOCH: AtomicU32 = AtomicU32::new(1);
+
+/// Snapshot of the current global epoch. Transactions call this at
+/// start (lower bound on the epoch their TID may be stamped with) and
+/// at commit (so their TID rises to at least the current value).
+#[inline]
+pub fn current_epoch() -> u32 {
+    GLOBAL_EPOCH.load(Ordering::Acquire)
+}
+
+/// Advance the global epoch by one and return the new value.
+/// `AcqRel` ordering so a dedicated bumper published writes are
+/// observable to later epoch readers, and vice versa — covers the
+/// future case where a timer-driven bumper rides on the same
+/// synchronization edge as worker commits.
+///
+/// Driver expectations: call from a single source (a timer handler or
+/// a dedicated idle loop) at roughly constant intervals. Multiple
+/// concurrent callers are safe but weaken the wall-time relationship.
+#[inline]
+pub fn advance_epoch() -> u32 {
+    // `fetch_add` returns the prior value; we want the new one.
+    GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+}
 
 /// Transaction identifier, packed in a single `u64`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +290,18 @@ mod tests {
         let (tid, val) = r.read_snapshot().unwrap();
         assert_eq!(val, 42);
         assert_eq!(tid, prior);
+    }
+
+    #[test]
+    fn advance_epoch_is_monotonic_and_returns_new_value() {
+        // The static counter is shared between tests, so only the
+        // delta is meaningful.
+        let before = current_epoch();
+        let after1 = advance_epoch();
+        let after2 = advance_epoch();
+        assert!(after1 > before);
+        assert_eq!(after2, after1 + 1);
+        assert_eq!(current_epoch(), after2);
     }
 
     #[test]
