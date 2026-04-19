@@ -11,6 +11,7 @@ mod bench;
 mod gdt;
 mod interrupts;
 mod memory;
+mod percpu;
 mod smp;
 
 #[cfg(not(feature = "bench"))]
@@ -40,6 +41,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         phys_mem_offset,
         l4_frame.start_address()
     );
+
+    // SMP-e: install the BSP's per-CPU slot and point GS base at it.
+    // BSP is always bring-up index 0.
+    unsafe { percpu::init(0) };
+    let bsp_cpu = unsafe { percpu::current() };
+    serial_println!("PERCPU: BSP cpu_index={}", bsp_cpu.cpu_index);
 
     // SMP-b: the LAPIC is needed to send IPIs for AP wake-up (SMP-d).
     // Safety: bootloader's `map_physical_memory` feature maps all physical

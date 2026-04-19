@@ -448,7 +448,17 @@ unsafe fn inject_identity_mapping(phys_mem_offset: u64) -> bool {
 /// trampoline's tail-jump. Runs on the per-AP 16 KiB stack with a
 /// System V ABI argument (the AP's APIC ID) in `rdi`.
 #[unsafe(no_mangle)]
-pub extern "C" fn ap_main(_apic_id: u64) -> ! {
+pub extern "C" fn ap_main(cpu_index: u64) -> ! {
+    // Install this AP's per-CPU slot first — every future access to
+    // `gs:[…]` on this CPU depends on it.
+    unsafe { crate::percpu::init(cpu_index as usize) };
+
+    // Verify GS-base round trip: `current().cpu_index` must match the
+    // value we just wrote. If not, GS is wrong and Silo state would be
+    // routed to the wrong slot.
+    let seen = unsafe { crate::percpu::current().cpu_index };
+    assert!(seen as u64 == cpu_index, "percpu GS base mismatch");
+
     ONLINE_APS.fetch_add(1, Ordering::Release);
     // Park the AP. Interrupts are masked from the trampoline's `cli`,
     // so `hlt` parks the core indefinitely.
@@ -526,13 +536,16 @@ pub unsafe fn init(phys_mem_offset: u64) {
         }
 
         let stack_top = unsafe { ap_stack_top(ap_index) };
+        // Header's `arg` is the per-CPU index (bring-up order). BSP is
+        // index 0 and skipped; APs are 1..=N in the order they come up.
+        let cpu_index = (ap_index + 1) as u64;
         unsafe {
             write_trampoline_header(
                 phys_mem_offset,
                 cr3_phys,
                 stack_top,
                 entry_addr,
-                cpu.apic_id as u64,
+                cpu_index,
             );
         }
 
