@@ -10,6 +10,11 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# `bench` swaps the crash-recovery gate for a latency microbench that puts
+# then reads, and prints TSC-cycle stats over the serial line.
+bench = []
+
 [dependencies]
 bootloader.workspace = true
 x86_64.workspace = true

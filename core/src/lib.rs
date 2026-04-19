@@ -10,6 +10,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod bench;
 pub mod bptree;
 pub mod kv;
 pub mod lba_alloc;

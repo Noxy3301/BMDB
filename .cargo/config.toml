@@ -32,5 +32,17 @@ kbuild = [
     "-p", "bmdb-kernel",
 ]
 
+# Boot the bench build under QEMU. Same as `krun` plus `--features bench`
+# on the kernel crate.
+kbench = [
+    "run",
+    "-Zbuild-std=core,compiler_builtins",
+    "-Zbuild-std-features=compiler-builtins-mem",
+    "-Zjson-target-spec",
+    "--target", "kernel/x86_64-bmdb.json",
+    "-p", "bmdb-kernel",
+    "--features", "bench",
+]
+
 # Host-side unit tests for the pure-logic `core` crate.
 ctest = ["test", "--target", "x86_64-unknown-linux-gnu", "-p", "bmdb-core"]
