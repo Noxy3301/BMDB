@@ -75,6 +75,16 @@ unsafe fn ap_stack_top(index: usize) -> u64 {
 /// Incremented by every AP when it reaches `ap_main`. BSP polls this.
 static ONLINE_APS: AtomicU32 = AtomicU32::new(0);
 
+/// SMP-f contention smoke: every AP does a bounded fetch_add spin on
+/// this counter before parking. The BSP then reads the total and checks
+/// it against `N_AP * CONTENTION_ITERS`. Non-zero mismatch would mean a
+/// lost update — which should be impossible given `fetch_add` is
+/// atomic — so the test doubles as a quick regression gate for the
+/// AP bring-up path touching memory correctly.
+pub(crate) static CONTENTION_COUNTER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(crate) const CONTENTION_ITERS: u64 = 10_000;
+
 // -- Timing ------------------------------------------------------------
 
 /// INIT→SIPI delay. Sized against a 5 GHz TSC so the wait exceeds
@@ -459,6 +469,13 @@ pub extern "C" fn ap_main(cpu_index: u64) -> ! {
     let seen = unsafe { crate::percpu::current().cpu_index };
     assert!(seen as u64 == cpu_index, "percpu GS base mismatch");
 
+    // SMP-f contention loop — ensures atomic RMW on a shared location
+    // works under real multi-core contention, not just single-AP
+    // round-trip.
+    for _ in 0..CONTENTION_ITERS {
+        CONTENTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
+
     ONLINE_APS.fetch_add(1, Ordering::Release);
     // Park the AP. Interrupts are masked from the trampoline's `cli`,
     // so `hlt` parks the core indefinitely.
@@ -598,4 +615,21 @@ pub unsafe fn init(phys_mem_offset: u64) {
 
     let total = ONLINE_APS.load(Ordering::Acquire);
     serial_println!("SMP: {} AP(s) online", total);
+
+    // SMP-f gate: every online AP did `CONTENTION_ITERS` atomic
+    // increments on `CONTENTION_COUNTER`. The total is a tight
+    // invariant — lost updates would collapse the sum.
+    let expected = total as u64 * CONTENTION_ITERS;
+    let got = CONTENTION_COUNTER.load(Ordering::Acquire);
+    if got == expected {
+        serial_println!(
+            "SMP: contention counter = {} (expected {}, no lost updates)",
+            got, expected,
+        );
+    } else {
+        serial_println!(
+            "SMP: contention counter = {} (expected {}, {} LOST)",
+            got, expected, expected.wrapping_sub(got),
+        );
+    }
 }
