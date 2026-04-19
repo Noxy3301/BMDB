@@ -15,6 +15,7 @@ pub mod bptree;
 pub mod kv;
 pub mod lba_alloc;
 pub mod storage;
+pub mod sync;
 pub mod wal;
 
 #[cfg(test)]
