@@ -146,3 +146,123 @@ impl Default for Kv {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem_storage::MemStorage;
+
+    fn k(i: u64) -> Key {
+        i.to_be_bytes()
+    }
+    fn v(i: u64) -> Value {
+        (i * 100).to_be_bytes()
+    }
+
+    #[test]
+    fn put_then_get_returns_value() {
+        let mut storage = MemStorage::new();
+        let mut kv = Kv::new();
+        kv.put(&mut storage, k(1), v(1)).unwrap();
+        assert_eq!(kv.get(k(1)), Some(v(1)));
+        assert_eq!(kv.get(k(2)), None);
+    }
+
+    #[test]
+    fn duplicate_put_rejected_without_wal_write() {
+        let mut storage = MemStorage::new();
+        let mut kv = Kv::new();
+        kv.put(&mut storage, k(1), v(1)).unwrap();
+        let flushes_before = storage.flush_count();
+
+        let err = kv.put(&mut storage, k(1), v(99));
+        assert!(matches!(err, Err(PutError::DuplicateKey)));
+
+        // No WAL append should have happened for the rejected put: flush
+        // count is unchanged and LSN has not advanced.
+        assert_eq!(storage.flush_count(), flushes_before);
+        assert_eq!(kv.next_lsn(), 2);
+        // Original value survives.
+        assert_eq!(kv.get(k(1)), Some(v(1)));
+    }
+
+    #[test]
+    fn recover_on_empty_storage_is_empty_kv() {
+        let mut storage = MemStorage::new();
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.next_lsn(), 1);
+        assert_eq!(kv.get(k(1)), None);
+    }
+
+    #[test]
+    fn recover_replays_every_put_in_order() {
+        let mut storage = MemStorage::new();
+        {
+            let mut kv = Kv::new();
+            for i in 1..=10u64 {
+                kv.put(&mut storage, k(i), v(i)).unwrap();
+            }
+        }
+
+        // Simulate a crash: throw away the in-memory Kv, rebuild from WAL.
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.next_lsn(), 11);
+        for i in 1..=10u64 {
+            assert_eq!(kv.get(k(i)), Some(v(i)), "missing key {} after recover", i);
+        }
+    }
+
+    #[test]
+    fn recover_skips_delete_records() {
+        // Phase 3 limitation: Delete records are skipped during replay
+        // because BpTree has no remove yet. To prove "skip" semantics (and
+        // not "actually delete"), put a key, then delete it, then recover
+        // and confirm the key survives. If replay honored Delete, the key
+        // would be gone.
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+
+        wal.append(&mut storage, Op::Put, 0, k(7), v(7)).unwrap();
+        wal.append(&mut storage, Op::Delete, 0, k(7), [0; 8]).unwrap();
+
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(
+            kv.get(k(7)),
+            Some(v(7)),
+            "Delete record must be skipped, not applied",
+        );
+        assert_eq!(kv.next_lsn(), 3);
+    }
+
+    #[test]
+    fn put_durability_across_simulated_crash() {
+        // Gate: put returns Ok → crash → recover → get returns the value.
+        let mut storage = MemStorage::new();
+        {
+            let mut kv = Kv::new();
+            kv.put(&mut storage, k(42), v(42)).unwrap();
+            // Drop kv here; represents a process crash.
+        }
+        let kv = Kv::recover(&mut storage).unwrap();
+        assert_eq!(kv.get(k(42)), Some(v(42)));
+    }
+
+    #[test]
+    fn many_put_then_recover_preserves_all() {
+        // Stress-test: insert enough keys to trigger B+tree splits, then
+        // recover and confirm every key is still accessible.
+        let mut storage = MemStorage::new();
+        {
+            let mut kv = Kv::new();
+            for i in 1..=40u64 {
+                kv.put(&mut storage, k(i), v(i)).unwrap();
+            }
+        }
+        let kv = Kv::recover(&mut storage).unwrap();
+        for i in 1..=40u64 {
+            assert_eq!(kv.get(k(i)), Some(v(i)), "lost key {} after recover", i);
+        }
+        let (_nodes, height) = kv.tree_stats();
+        assert!(height >= 2, "40 inserts should grow the tree beyond a single leaf");
+    }
+}

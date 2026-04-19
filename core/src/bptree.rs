@@ -383,3 +383,110 @@ impl fmt::Debug for BpTree {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn k(i: u64) -> Key {
+        i.to_be_bytes()
+    }
+    fn v(i: u64) -> Value {
+        (i * 1000).to_be_bytes()
+    }
+
+    #[test]
+    fn lookup_on_empty_tree_returns_none() {
+        let tree = BpTree::new();
+        assert_eq!(tree.lookup(k(42)), None);
+        assert_eq!(tree.height(), 0);
+        assert_eq!(tree.num_nodes(), 0);
+    }
+
+    #[test]
+    fn insert_single_then_lookup() {
+        let mut tree = BpTree::new();
+        tree.insert(k(1), v(1)).unwrap();
+        assert_eq!(tree.lookup(k(1)), Some(v(1)));
+        assert_eq!(tree.lookup(k(2)), None);
+        assert_eq!(tree.height(), 1);
+        assert_eq!(tree.num_nodes(), 1);
+    }
+
+    #[test]
+    fn duplicate_key_is_rejected() {
+        let mut tree = BpTree::new();
+        tree.insert(k(5), v(5)).unwrap();
+        assert_eq!(tree.insert(k(5), v(99)), Err(InsertError::DuplicateKey));
+        // Original value must still be intact.
+        assert_eq!(tree.lookup(k(5)), Some(v(5)));
+    }
+
+    #[test]
+    fn insert_many_sequential_keys_all_found() {
+        let mut tree = BpTree::new();
+        for i in 1..=50u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        for i in 1..=50u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)), "missing key {}", i);
+        }
+        assert!(tree.height() >= 2, "50 keys should trigger at least one split");
+    }
+
+    #[test]
+    fn insert_many_reverse_keys_all_found() {
+        let mut tree = BpTree::new();
+        for i in (1..=50u64).rev() {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        for i in 1..=50u64 {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)), "missing key {}", i);
+        }
+    }
+
+    #[test]
+    fn lookup_between_existing_keys_returns_none() {
+        let mut tree = BpTree::new();
+        for i in [2u64, 4, 6, 8, 10] {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        for i in [1u64, 3, 5, 7, 9, 11] {
+            assert_eq!(tree.lookup(k(i)), None, "phantom hit on key {}", i);
+        }
+    }
+
+    #[test]
+    fn first_split_creates_internal_root() {
+        let mut tree = BpTree::new();
+        // MAX_KEYS = ORDER - 1 = 15. The 16th insert forces a leaf split and
+        // allocates a new internal root.
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert_eq!(tree.height(), 2, "first split should make root internal");
+        assert_eq!(tree.num_nodes(), 3, "root + left leaf + right leaf");
+    }
+
+    #[test]
+    fn pool_exhaustion_is_reported() {
+        let mut tree = BpTree::new();
+        let mut last_err = None;
+        // Insert until the pool refuses. Keys well under u32 range, no
+        // duplicates.
+        for i in 1..=10_000u64 {
+            if let Err(e) = tree.insert(k(i), v(i)) {
+                last_err = Some((i, e));
+                break;
+            }
+        }
+        let (stop_at, err) = last_err.expect("should eventually exhaust the pool");
+        assert_eq!(err, InsertError::NodePoolExhausted);
+        // Everything up to (stop_at - 1) was inserted successfully and must
+        // still be readable — the capacity pre-check leaves the tree
+        // untouched on failure.
+        for i in 1..stop_at {
+            assert_eq!(tree.lookup(k(i)), Some(v(i)));
+        }
+    }
+}

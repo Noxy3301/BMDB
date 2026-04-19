@@ -6,8 +6,15 @@
 
 #![no_std]
 
+// Pull in `std` only when building tests; the production crate stays `no_std`.
+#[cfg(test)]
+extern crate std;
+
 pub mod bptree;
 pub mod kv;
 pub mod lba_alloc;
 pub mod storage;
 pub mod wal;
+
+#[cfg(test)]
+mod mem_storage;

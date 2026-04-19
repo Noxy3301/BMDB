@@ -208,3 +208,155 @@ impl Default for Wal {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lba_alloc::wal_end;
+    use crate::mem_storage::MemStorage;
+
+    fn sample_record() -> Record {
+        Record::new(Op::Put, 7, 3, *b"key00001", *b"val00001")
+    }
+
+    #[test]
+    fn record_roundtrip_through_block() {
+        let rec = sample_record();
+        let mut block = [0u8; BLOCK_SIZE];
+        encode(&rec, &mut block);
+        let back = decode(&block);
+        assert!(back.is_valid());
+        assert_eq!(back.lsn, rec.lsn);
+        assert_eq!(back.epoch, rec.epoch);
+        assert_eq!(back.op(), Some(Op::Put));
+        assert_eq!(back.key, rec.key);
+        assert_eq!(back.value, rec.value);
+    }
+
+    #[test]
+    fn fresh_record_is_valid() {
+        assert!(sample_record().is_valid());
+    }
+
+    #[test]
+    fn bit_flip_in_payload_detected() {
+        let rec = sample_record();
+        let mut block = [0u8; BLOCK_SIZE];
+        encode(&rec, &mut block);
+        // Corrupt a byte inside the key field.
+        block[40] ^= 0x01;
+        let back = decode(&block);
+        assert!(!back.is_valid(), "corruption must invalidate the checksum");
+    }
+
+    #[test]
+    fn zeroed_block_is_invalid() {
+        let back = decode(&[0u8; BLOCK_SIZE]);
+        assert!(!back.is_valid(), "unwritten block must not look like a record");
+    }
+
+    #[test]
+    fn append_assigns_sequential_lsns() {
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+
+        let lsn0 = wal
+            .append(&mut storage, Op::Put, 0, *b"a\0\0\0\0\0\0\0", *b"A\0\0\0\0\0\0\0")
+            .unwrap();
+        let lsn1 = wal
+            .append(&mut storage, Op::Put, 0, *b"b\0\0\0\0\0\0\0", *b"B\0\0\0\0\0\0\0")
+            .unwrap();
+
+        assert_eq!(lsn0, 1);
+        assert_eq!(lsn1, 2);
+        assert_eq!(wal.next_lsn(), 3);
+        assert_eq!(wal.next_lba(), WAL_START + 2);
+        // One flush per append is the Phase 3 policy (durable-before-return).
+        assert_eq!(storage.flush_count(), 2);
+    }
+
+    #[test]
+    fn read_at_returns_appended_record() {
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+
+        let _ = wal
+            .append(&mut storage, Op::Delete, 9, *b"key_____", [0; 8])
+            .unwrap();
+
+        let rec = Wal::read_at(&mut storage, WAL_START).unwrap().unwrap();
+        assert_eq!(rec.lsn, 1);
+        assert_eq!(rec.epoch, 9);
+        assert_eq!(rec.op(), Some(Op::Delete));
+        assert_eq!(rec.key, *b"key_____");
+    }
+
+    #[test]
+    fn recover_on_empty_storage_is_empty_wal() {
+        let mut storage = MemStorage::new();
+        let wal = Wal::recover(&mut storage).unwrap();
+        assert_eq!(wal.next_lba(), WAL_START);
+        assert_eq!(wal.next_lsn(), 1);
+    }
+
+    #[test]
+    fn recover_restores_cursor_after_appends() {
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        for i in 1..=5 {
+            wal.append(&mut storage, Op::Put, 0, (i as u64).to_be_bytes(), [0; 8])
+                .unwrap();
+        }
+        let recovered = Wal::recover(&mut storage).unwrap();
+        assert_eq!(recovered.next_lsn(), 6);
+        assert_eq!(recovered.next_lba(), WAL_START + 5);
+    }
+
+    #[test]
+    fn recover_stops_at_first_invalid_block() {
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        for i in 1..=3 {
+            wal.append(&mut storage, Op::Put, 0, (i as u64).to_be_bytes(), [0; 8])
+                .unwrap();
+        }
+        // Clobber the fourth slot with garbage.
+        let mut garbage = [0u8; BLOCK_SIZE];
+        garbage[0] = 0x55;
+        storage.force_write(WAL_START + 3, garbage);
+
+        // Place a well-formed record *after* the corrupt slot. If recovery
+        // naively scanned past the first invalid block, it would see this
+        // record and advance `next_lba` past it. Stopping at the corrupt
+        // block means this record stays unreached.
+        let past_gap = Record::new(Op::Put, 99, 0, [0xBB; 8], [0; 8]);
+        let mut past_block = [0u8; BLOCK_SIZE];
+        encode(&past_gap, &mut past_block);
+        storage.force_write(WAL_START + 4, past_block);
+
+        let recovered = Wal::recover(&mut storage).unwrap();
+        assert_eq!(recovered.next_lba(), WAL_START + 3);
+        assert_eq!(recovered.next_lsn(), 4);
+
+        // Double-check: the record past the gap really is valid on its own,
+        // so the test is probing recovery behavior, not record construction.
+        let probe = Wal::read_at(&mut storage, WAL_START + 4).unwrap();
+        assert!(probe.is_some(), "record after gap must be intact");
+    }
+
+    #[test]
+    fn record_size_matches_checksum_offset() {
+        // Guard against accidental layout drift that would invalidate the
+        // checksum loop's `CHECKSUM_OFFSET` constant.
+        assert_eq!(core::mem::size_of::<Record>(), 56);
+        assert_eq!(
+            core::mem::offset_of!(Record, checksum),
+            Record::CHECKSUM_OFFSET
+        );
+    }
+
+    #[test]
+    fn region_end_constants_are_self_consistent() {
+        assert_eq!(wal_end(), WAL_START + crate::lba_alloc::WAL_LEN - 1);
+    }
+}
