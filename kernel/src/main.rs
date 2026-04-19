@@ -4,6 +4,7 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+mod acpi;
 mod apic;
 #[cfg(feature = "bench")]
 mod bench;
@@ -43,6 +44,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Safety: bootloader's `map_physical_memory` feature maps all physical
     // memory at `phys_mem_offset`, and `kernel_main` runs exactly once.
     unsafe { apic::init(phys_mem_offset.as_u64()) };
+
+    // SMP-c: enumerate APs via ACPI MADT so SMP-d knows what to wake.
+    unsafe { acpi::init(phys_mem_offset.as_u64()) };
 
     serial_println!("PCI devices on bus 0:");
     bmdb_pci::scan_bus(0);
