@@ -14,10 +14,13 @@
 //! with keys `k_0..k_{n-1}` and children `c_0..c_n`, every key in `c_i` is
 //! strictly less than `k_i`, and every key in `c_{i+1}` is at least `k_i`.
 //!
-//! Supported operations: `insert`, `upsert`, `lookup`, `delete`. No range
-//! scan, no concurrency. The node pool is a static array; allocation uses a
-//! bump pointer with a free list of nodes freed by merges during delete, so
+//! Supported operations: `insert`, `upsert`, `lookup`, `delete`, `range`.
+//! No concurrency. The node pool is a static array; allocation uses a bump
+//! pointer with a free list of nodes freed by merges during delete, so
 //! delete-then-insert traffic does not leak capacity.
+//!
+//! Range scans walk the forward leaf chain maintained by `next_leaf`, which
+//! is spliced on leaf split (insert) and on leaf merge (delete).
 
 use core::fmt;
 
@@ -229,6 +232,45 @@ impl BpTree {
             return None;
         }
         self.lookup_rec(self.root, key)
+    }
+
+    /// Iterate every `(key, value)` whose key falls in the half-open
+    /// interval `[start, end)`, in ascending key order. The traversal
+    /// follows the leaf-forward chain, so its cost is proportional to the
+    /// number of yielded entries plus the depth of the initial descent.
+    ///
+    /// Degenerate inputs (`start >= end`, or an empty tree) yield an empty
+    /// iterator without descending.
+    pub fn range(&self, start: Key, end: Key) -> Range<'_> {
+        if self.root == NULL_NODE || start >= end {
+            return Range {
+                tree: self,
+                current_leaf: NULL_NODE,
+                current_idx: 0,
+                end,
+            };
+        }
+
+        // `find_leaf_id(start)` lands on the leaf that *would* contain
+        // `start` if it were present — i.e., the lookup leaf. When `start`
+        // falls in a gap, that can be the predecessor leaf. The skip loop
+        // below advances past any keys strictly less than `start` inside
+        // that leaf, and `next()` walks `next_leaf` if the whole leaf is
+        // below `start`. Together they reach the first key `>= start`.
+        let leaf_id = self.find_leaf_id(start).expect("non-empty tree has a leaf");
+
+        let node = &self.pool[leaf_id as usize];
+        let n = node.n_keys as usize;
+        let mut i = 0;
+        while i < n && node.keys[i] < start {
+            i += 1;
+        }
+        Range {
+            tree: self,
+            current_leaf: leaf_id,
+            current_idx: i as u16,
+            end,
+        }
     }
 
     fn lookup_rec(&self, node_id: NodeId, key: Key) -> Option<Value> {
@@ -779,6 +821,46 @@ impl Default for BpTree {
     }
 }
 
+/// Forward iterator over leaf entries produced by [`BpTree::range`]. Walks
+/// the leaf chain in key order; terminates either when the next key would
+/// reach `end` or when the chain runs out.
+pub struct Range<'a> {
+    tree: &'a BpTree,
+    // NULL_NODE signals exhaustion; `next` returns None without any further
+    // pool access once this is set.
+    current_leaf: NodeId,
+    current_idx: u16,
+    end: Key,
+}
+
+impl<'a> Iterator for Range<'a> {
+    type Item = (Key, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_leaf != NULL_NODE {
+            let node = &self.tree.pool[self.current_leaf as usize];
+            let n = node.n_keys as usize;
+            let i = self.current_idx as usize;
+            if i < n {
+                let key = node.keys[i];
+                if key >= self.end {
+                    // Past the range. Stop without advancing so repeated
+                    // `next()` calls keep returning None.
+                    self.current_leaf = NULL_NODE;
+                    return None;
+                }
+                let value = node.values[i];
+                self.current_idx += 1;
+                return Some((key, value));
+            }
+            // Current leaf exhausted; walk the forward chain.
+            self.current_leaf = node.next_leaf;
+            self.current_idx = 0;
+        }
+        None
+    }
+}
+
 impl fmt::Debug for BpTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -873,6 +955,131 @@ mod tests {
         }
         assert_eq!(tree.height(), 2, "first split should make root internal");
         assert_eq!(tree.num_nodes(), 3, "root + left leaf + right leaf");
+    }
+
+    #[test]
+    fn range_on_empty_tree_yields_nothing() {
+        let tree = BpTree::new();
+        let v: std::vec::Vec<_> = tree.range(k(0), k(100)).collect();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn range_with_empty_interval_yields_nothing() {
+        let mut tree = BpTree::new();
+        for i in 1..=5u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        // start == end and start > end are both empty ranges.
+        let a: std::vec::Vec<_> = tree.range(k(3), k(3)).collect();
+        let b: std::vec::Vec<_> = tree.range(k(5), k(1)).collect();
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn range_within_single_leaf() {
+        let mut tree = BpTree::new();
+        for i in 1..=10u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let got: std::vec::Vec<_> = tree.range(k(3), k(7)).collect();
+        let expected: std::vec::Vec<_> = (3..7u64).map(|i| (k(i), v(i))).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn range_starts_between_existing_keys() {
+        // Request [3, 7) on a tree with even keys only. Should yield 4 and 6.
+        let mut tree = BpTree::new();
+        for i in [2u64, 4, 6, 8, 10] {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let got: std::vec::Vec<_> = tree.range(k(3), k(7)).collect();
+        assert_eq!(got, std::vec![(k(4), v(4)), (k(6), v(6))]);
+    }
+
+    #[test]
+    fn range_crosses_multiple_leaves() {
+        // 30 sequential inserts guarantee at least one split; a wide range
+        // must walk the leaf chain through multiple leaves.
+        let mut tree = BpTree::new();
+        for i in 1..=30u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert!(tree.height() >= 2);
+        let got: std::vec::Vec<_> = tree.range(k(5), k(25)).collect();
+        let expected: std::vec::Vec<_> = (5..25u64).map(|i| (k(i), v(i))).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn range_end_beyond_max_key_scans_to_end_of_chain() {
+        let mut tree = BpTree::new();
+        for i in 1..=30u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let got: std::vec::Vec<_> = tree.range(k(28), k(u64::MAX)).collect();
+        assert_eq!(got, std::vec![(k(28), v(28)), (k(29), v(29)), (k(30), v(30))]);
+    }
+
+    #[test]
+    fn range_full_scan_returns_all_keys_in_order() {
+        let mut tree = BpTree::new();
+        // Insert out of order; the leaf chain should still surface keys in
+        // ascending order.
+        for i in [17u64, 3, 42, 1, 99, 25, 8, 30, 12, 50] {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let got: std::vec::Vec<_> = tree.range(k(0), k(u64::MAX)).collect();
+        let mut expected: std::vec::Vec<u64> = std::vec![17, 3, 42, 1, 99, 25, 8, 30, 12, 50];
+        expected.sort();
+        let expected_pairs: std::vec::Vec<_> =
+            expected.iter().map(|&i| (k(i), v(i))).collect();
+        assert_eq!(got, expected_pairs);
+    }
+
+    #[test]
+    fn range_after_delete_merge_stays_consistent() {
+        // Trigger a leaf merge (see delete_triggers_leaf_merge_and_root_collapse)
+        // and then range-scan. The forward chain must still visit every
+        // surviving key exactly once.
+        let mut tree = BpTree::new();
+        for i in 1..=16u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        assert_eq!(tree.delete(k(1)), Some(v(1)));
+        assert_eq!(tree.delete(k(2)), Some(v(2)));
+        assert_eq!(tree.delete(k(3)), Some(v(3)));
+
+        let got: std::vec::Vec<_> = tree.range(k(0), k(u64::MAX)).collect();
+        let expected: std::vec::Vec<_> = (4..=16u64).map(|i| (k(i), v(i))).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn range_with_start_past_max_key_is_empty() {
+        // When `start` is greater than every key in the tree, the skip
+        // loop exhausts the landing leaf and the chain walk reaches
+        // NULL_NODE without ever yielding.
+        let mut tree = BpTree::new();
+        for i in 1..=30u64 {
+            tree.insert(k(i), v(i)).unwrap();
+        }
+        let got: std::vec::Vec<_> = tree.range(k(100), k(u64::MAX)).collect();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn range_is_fused_after_end_of_chain() {
+        // Once the iterator yields None, repeated next() must continue to
+        // yield None without further pool access.
+        let mut tree = BpTree::new();
+        tree.insert(k(1), v(1)).unwrap();
+        let mut iter = tree.range(k(0), k(10));
+        assert_eq!(iter.next(), Some((k(1), v(1))));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
