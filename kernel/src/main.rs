@@ -4,6 +4,7 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+mod apic;
 #[cfg(feature = "bench")]
 mod bench;
 mod gdt;
@@ -37,6 +38,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         phys_mem_offset,
         l4_frame.start_address()
     );
+
+    // SMP-b: the LAPIC is needed to send IPIs for AP wake-up (SMP-d).
+    // Safety: bootloader's `map_physical_memory` feature maps all physical
+    // memory at `phys_mem_offset`, and `kernel_main` runs exactly once.
+    unsafe { apic::init(phys_mem_offset.as_u64()) };
 
     serial_println!("PCI devices on bus 0:");
     bmdb_pci::scan_bus(0);
