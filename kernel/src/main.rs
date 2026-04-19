@@ -11,6 +11,7 @@ mod bench;
 mod gdt;
 mod interrupts;
 mod memory;
+mod smp;
 
 #[cfg(not(feature = "bench"))]
 use bmdb_core::kv::Kv;
@@ -47,6 +48,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // SMP-c: enumerate APs via ACPI MADT so SMP-d knows what to wake.
     unsafe { acpi::init(phys_mem_offset.as_u64()) };
+
+    // SMP-d.1: copy the real-mode trampoline and probe each AP with
+    // INIT + SIPI. Marker-byte validation only; full mode transition
+    // and Rust AP entry come in SMP-d.2.
+    unsafe { smp::init(phys_mem_offset.as_u64()) };
 
     serial_println!("PCI devices on bus 0:");
     bmdb_pci::scan_bus(0);
