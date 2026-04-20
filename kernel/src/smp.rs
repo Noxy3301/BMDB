@@ -81,8 +81,10 @@ static ONLINE_APS: AtomicU32 = AtomicU32::new(0);
 /// lost update — which should be impossible given `fetch_add` is
 /// atomic — so the test doubles as a quick regression gate for the
 /// AP bring-up path touching memory correctly.
+#[cfg(not(feature = "silo-bench"))]
 pub(crate) static CONTENTION_COUNTER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(feature = "silo-bench"))]
 pub(crate) const CONTENTION_ITERS: u64 = 10_000;
 
 // -- Timing ------------------------------------------------------------
@@ -469,12 +471,16 @@ pub extern "C" fn ap_main(cpu_index: u64) -> ! {
     let seen = unsafe { crate::percpu::current().cpu_index };
     assert!(seen as u64 == cpu_index, "percpu GS base mismatch");
 
-    // SMP-f contention loop — ensures atomic RMW on a shared location
-    // works under real multi-core contention, not just single-AP
-    // round-trip.
+    // Concurrency smoke test. `silo-bench` replaces this with the real
+    // Silo OCC workload so BSP orchestration can collect per-AP commit
+    // / abort counters; without the feature the plain atomic RMW loop
+    // still guarantees SMP is live.
+    #[cfg(not(feature = "silo-bench"))]
     for _ in 0..CONTENTION_ITERS {
         CONTENTION_COUNTER.fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(feature = "silo-bench")]
+    crate::silo_bench::ap_worker(cpu_index as usize);
 
     ONLINE_APS.fetch_add(1, Ordering::Release);
     // Park the AP. Interrupts are masked from the trampoline's `cli`,
@@ -618,18 +624,31 @@ pub unsafe fn init(phys_mem_offset: u64) {
 
     // SMP-f gate: every online AP did `CONTENTION_ITERS` atomic
     // increments on `CONTENTION_COUNTER`. The total is a tight
-    // invariant — lost updates would collapse the sum.
-    let expected = total as u64 * CONTENTION_ITERS;
-    let got = CONTENTION_COUNTER.load(Ordering::Acquire);
-    if got == expected {
-        serial_println!(
-            "SMP: contention counter = {} (expected {}, no lost updates)",
-            got, expected,
-        );
-    } else {
-        serial_println!(
-            "SMP: contention counter = {} (expected {}, {} LOST)",
-            got, expected, expected.wrapping_sub(got),
-        );
+    // invariant — lost updates would collapse the sum. `silo-bench`
+    // replaces the contention loop with Silo transactions, so this
+    // sum is not meaningful there.
+    #[cfg(not(feature = "silo-bench"))]
+    {
+        let expected = total as u64 * CONTENTION_ITERS;
+        let got = CONTENTION_COUNTER.load(Ordering::Acquire);
+        if got == expected {
+            serial_println!(
+                "SMP: contention counter = {} (expected {}, no lost updates)",
+                got, expected,
+            );
+        } else {
+            serial_println!(
+                "SMP: contention counter = {} (expected {}, {} LOST)",
+                got, expected, expected.wrapping_sub(got),
+            );
+        }
     }
+}
+
+/// Number of non-BSP APs that finished `ap_main` (and therefore
+/// completed their silo-bench workload on `--features silo-bench`).
+/// The BSP reads this to size its aggregation loop.
+#[cfg(feature = "silo-bench")]
+pub fn online_aps() -> u32 {
+    ONLINE_APS.load(Ordering::Acquire)
 }

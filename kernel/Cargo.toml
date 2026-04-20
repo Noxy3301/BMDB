@@ -14,6 +14,9 @@ bench = false
 # `bench` swaps the crash-recovery gate for a latency microbench that puts
 # then reads, and prints TSC-cycle stats over the serial line.
 bench = []
+# `silo-bench` drives a concurrent Silo OCC workload across every AP and
+# a group-commit persist on the BSP. Mutually exclusive with `bench`.
+silo-bench = []
 
 [dependencies]
 bootloader.workspace = true

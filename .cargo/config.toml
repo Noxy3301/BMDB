@@ -44,5 +44,16 @@ kbench = [
     "--features", "bench",
 ]
 
+# Concurrent Silo OCC workload + group-commit persist across every AP.
+ksilobench = [
+    "run",
+    "-Zbuild-std=core,compiler_builtins",
+    "-Zbuild-std-features=compiler-builtins-mem",
+    "-Zjson-target-spec",
+    "--target", "kernel/x86_64-bmdb.json",
+    "-p", "bmdb-kernel",
+    "--features", "silo-bench",
+]
+
 # Host-side unit tests for the pure-logic `core` crate.
 ctest = ["test", "--target", "x86_64-unknown-linux-gnu", "-p", "bmdb-core"]

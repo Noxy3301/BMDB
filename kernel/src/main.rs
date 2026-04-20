@@ -12,9 +12,11 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod percpu;
+#[cfg(feature = "silo-bench")]
+mod silo_bench;
 mod smp;
 
-#[cfg(not(feature = "bench"))]
+#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
 use bmdb_core::kv::Kv;
 use bmdb_core::lba_alloc;
 use bmdb_serial::serial_println;
@@ -77,7 +79,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     #[cfg(feature = "bench")]
     bench::run_bench(&mut nvme);
-    #[cfg(not(feature = "bench"))]
+    #[cfg(feature = "silo-bench")]
+    silo_bench::run(&mut nvme, smp::online_aps());
+    #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
     kv_gate_test(&mut nvme);
 
     serial_println!("It did not crash!");
@@ -90,7 +94,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 /// next LSN, and verifies that every previously-recovered record is still
 /// readable. Runs on every boot; the recovered count grows by one per run,
 /// proving durability across `timeout` / kill / restart cycles.
-#[cfg(not(feature = "bench"))]
+#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
 fn kv_gate_test(nvme: &mut bmdb_nvme::Controller) {
     let mut kv = Kv::recover(nvme).expect("KV recover failed");
 
