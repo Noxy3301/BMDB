@@ -12,6 +12,7 @@ extern crate std;
 
 pub mod bench;
 pub mod bptree;
+pub mod ebr;
 pub mod kv;
 pub mod lba_alloc;
 pub mod silo;

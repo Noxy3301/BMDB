@@ -38,3 +38,9 @@ run-args = [
     "-drive", "file=nvme.img,format=raw,if=none,id=nvme0",
     "-device", "nvme,serial=BMDB0001,drive=nvme0",
 ]
+
+# To measure on KVM instead of TCG (host CPU passthrough, ~50-100x
+# faster for tight atomic loops): add the user to the `kvm` group
+# (`sudo usermod -aG kvm $USER`, log out and back in) and run with
+# `cargo ksilobench -- -enable-kvm -cpu host`. bootimage forwards
+# unknown args to QEMU, so no config change is needed.
