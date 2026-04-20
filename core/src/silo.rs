@@ -281,13 +281,18 @@ impl WriteEntry {
 /// Per-transaction scratch state. Sized for the worst case and kept
 /// on the owning CPU (no heap, no cross-CPU sharing); a transaction
 /// owns one `TxnState` throughout its lifetime, then `reset`s it for
-/// the next one.
+/// the next one. `last_commit_tid` survives `reset` — it is the
+/// worker's most-recent-committed TID, which the Silo paper's §4.2
+/// formula requires in the new-TID max (`max(last_commit, max_read,
+/// max_write) + 1`) so that TIDs assigned by a single worker advance
+/// monotonically across transactions.
 pub struct TxnState {
     start_epoch: u32,
     read_count: u32,
     read_set: [ReadEntry; MAX_RW_SET],
     write_count: u32,
     write_set: [WriteEntry; MAX_RW_SET],
+    last_commit_tid: Tid,
 }
 
 impl TxnState {
@@ -298,11 +303,20 @@ impl TxnState {
             read_set: [ReadEntry::EMPTY; MAX_RW_SET],
             write_count: 0,
             write_set: [WriteEntry::EMPTY; MAX_RW_SET],
+            last_commit_tid: Tid::from_raw(0),
         }
     }
 
     pub fn start_epoch(&self) -> u32 {
         self.start_epoch
+    }
+
+    /// The worker's most recent committed TID, or `Tid::from_raw(0)`
+    /// if no commit has landed on this `TxnState` yet. Exposed for
+    /// tests that want to verify monotonicity without running the
+    /// full commit path.
+    pub fn last_commit_tid(&self) -> Tid {
+        self.last_commit_tid
     }
 
     pub fn read_entries(&self) -> &[ReadEntry] {
@@ -472,13 +486,12 @@ pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
     }
 
     // 5. New TID: epoch = current global; sequence = 1 + max seen
-    // across the read and write sets. Silo's paper also factors in
-    // the owning CPU's last-assigned sequence; this implementation
-    // omits that term. The record-lock exclusion already serializes
-    // writers on overlapping records, and epoch advance erases the
-    // sequence space between successive worker transactions. The
-    // omission is a known and deliberate spec drift for the
-    // feasibility phase.
+    // across the read set, the write set, and the worker's own most
+    // recent commit (Silo paper §4.2). The last-commit term keeps
+    // the per-worker TID sequence monotonic across transactions
+    // whose read/write sets don't overlap anything the worker has
+    // touched recently — without it, two disjoint same-worker
+    // commits in the same epoch could mint identical TIDs.
     let mut max_seq: u32 = 0;
     for read in &state.read_set[..read_count] {
         max_seq = max_seq.max(read.tid_at_read.sequence());
@@ -486,6 +499,13 @@ pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
     for (i, _entry) in write_slice.iter().enumerate() {
         let prior = Tid::from_raw(lock_versions[i]);
         max_seq = max_seq.max(prior.sequence());
+    }
+    // Include the worker's own last-committed sequence only when it
+    // lives in the epoch we're about to stamp. Epoch advance resets
+    // the sequence space, so a last-commit from an older epoch
+    // carries no ordering constraint in the new one.
+    if state.last_commit_tid.epoch() == epoch {
+        max_seq = max_seq.max(state.last_commit_tid.sequence());
     }
     // If the 29-bit sequence would wrap, aborting protects read
     // validation from an ABA hole (wrapped TID collides with an older
@@ -503,6 +523,10 @@ pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
         let record = unsafe { &*(entry.record_addr as *const Record) };
         unsafe { record.install(new_tid, entry.new_value) };
     }
+
+    // Publish the new commit TID so the next transaction on this
+    // TxnState sees it in step 5.
+    state.last_commit_tid = new_tid;
 
     CommitOutcome::Committed { new_tid }
 }
@@ -1050,6 +1074,76 @@ mod tests {
 
         let outcome = unsafe { commit(&mut txn) };
         assert_eq!(outcome, CommitOutcome::AbortedSequenceExhausted);
+    }
+
+    #[test]
+    fn disjoint_same_worker_commits_get_monotonic_tids() {
+        // Silo paper §4.2 requires that a single worker's commit TIDs
+        // rise monotonically even when two successive transactions
+        // touch disjoint records. Without last_commit_tid in the max,
+        // both commits would compute `max_seq = 0` from their
+        // fresh-TID read sets and mint identical TIDs — which would
+        // then sort-collapse during recovery.
+        let r_a = Record::new(Tid::new(current_epoch(), 0), 0);
+        let r_b = Record::new(Tid::new(current_epoch(), 0), 0);
+
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_write(&r_a, [0; 8], 1).unwrap();
+        let tid_1 = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("first commit failed: {:?}", other),
+        };
+
+        // Reset and commit on a disjoint record. Without the paper's
+        // last-commit term, `max_seq` here would be 0 and `tid_2`
+        // would collide with `tid_1`.
+        txn.reset(current_epoch());
+        txn.add_write(&r_b, [0; 8], 2).unwrap();
+        let tid_2 = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("second commit failed: {:?}", other),
+        };
+
+        assert!(
+            tid_2.raw() > tid_1.raw(),
+            "same-worker TIDs must rise monotonically: tid_1={:?} tid_2={:?}",
+            tid_1,
+            tid_2,
+        );
+        assert_eq!(txn.last_commit_tid(), tid_2);
+    }
+
+    #[test]
+    fn last_commit_tid_resets_across_epoch_boundary() {
+        // Bump the global epoch between two same-worker commits. The
+        // new-epoch commit starts with a fresh sequence space and
+        // must not inherit the old epoch's sequence — the per-worker
+        // monotonicity condition is trivially satisfied by the
+        // higher epoch in `tid.raw()`.
+        let r = Record::new(Tid::new(current_epoch(), 0), 0);
+
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_write(&r, [0; 8], 1).unwrap();
+        let tid_old = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("first commit failed: {:?}", other),
+        };
+
+        let new_epoch = advance_epoch();
+        txn.reset(new_epoch);
+        txn.add_write(&r, [0; 8], 2).unwrap();
+        let tid_new = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("second commit failed: {:?}", other),
+        };
+
+        assert!(tid_new.epoch() > tid_old.epoch());
+        assert!(
+            tid_new.raw() > tid_old.raw(),
+            "cross-epoch TIDs must still rise: tid_old={:?} tid_new={:?}",
+            tid_old,
+            tid_new,
+        );
     }
 
     #[test]
