@@ -1201,6 +1201,83 @@ mod tests {
     }
 
     #[test]
+    fn commit_then_persist_then_recover_preserves_writes() {
+        // End-to-end gate for Silo durability: run real commits through
+        // the OCC protocol, buffer their log entries, persist once, and
+        // then simulate a crash by walking the WAL from scratch.  The
+        // replayed view must match the final committed values.
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        let mut buf = LogBuffer::new();
+
+        // Three records sitting in a "table" — the commit protocol
+        // locks and publishes through their atomics.
+        let r_a = Record::new(Tid::new(current_epoch(), 0), 0);
+        let r_b = Record::new(Tid::new(current_epoch(), 0), 0);
+        let r_c = Record::new(Tid::new(current_epoch(), 0), 0);
+        let key_a = *b"keyA____";
+        let key_b = *b"keyB____";
+        let key_c = *b"keyC____";
+
+        // Txn 1: write A and B.
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_write(&r_a, key_a, 11).unwrap();
+        txn.add_write(&r_b, key_b, 22).unwrap();
+        let commit_epoch_1 = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid.epoch(),
+            other => panic!("txn 1 did not commit: {:?}", other),
+        };
+        buf.record_commit(commit_epoch_1, txn.write_entries()).unwrap();
+
+        // Txn 2: overwrite B, write C. Simulates a later epoch if the
+        // global has advanced; if not, both land at the same epoch.
+        txn.reset(current_epoch());
+        txn.add_write(&r_b, key_b, 222).unwrap();
+        txn.add_write(&r_c, key_c, 33).unwrap();
+        let commit_epoch_2 = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid.epoch(),
+            other => panic!("txn 2 did not commit: {:?}", other),
+        };
+        buf.record_commit(commit_epoch_2, txn.write_entries()).unwrap();
+
+        // One flush covers every log entry from both commits.
+        persist(&mut storage, &mut wal, &mut [&mut buf]).unwrap();
+        assert_eq!(storage.flush_count(), 1);
+        assert!(durable_epoch() >= commit_epoch_2);
+
+        // "Crash": throw away wal, buf, and the records. Only storage
+        // remains. Recovery rebuilds the on-disk state from scratch.
+        drop(wal);
+        drop(buf);
+        drop(r_a);
+        drop(r_b);
+        drop(r_c);
+
+        let recovered = Wal::recover(&mut storage).unwrap();
+        assert_eq!(recovered.next_lsn(), 5, "4 log records, next LSN = 5");
+
+        // Replay: build a key→value map by walking the log in LSN order.
+        // Each entry's value overwrites any prior entry for the same key,
+        // matching Silo's last-writer-wins recovery semantics.
+        use crate::lba_alloc::WAL_START;
+        use std::collections::HashMap;
+        let mut state: HashMap<[u8; 8], u64> = HashMap::new();
+        let mut lba = WAL_START;
+        while lba < recovered.next_lba() {
+            let rec = Wal::read_at(&mut storage, lba).unwrap().unwrap();
+            let value = u64::from_be_bytes(rec.value);
+            state.insert(rec.key, value);
+            lba += 1;
+        }
+
+        assert_eq!(state.get(&key_a).copied(), Some(11));
+        assert_eq!(state.get(&key_b).copied(), Some(222));
+        assert_eq!(state.get(&key_c).copied(), Some(33));
+    }
+
+    #[test]
     fn advance_epoch_is_monotonic_and_returns_new_value() {
         // The static counter is shared between tests, so only the
         // delta is meaningful.
