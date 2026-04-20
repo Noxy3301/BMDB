@@ -504,6 +504,141 @@ pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
     CommitOutcome::Committed { new_tid }
 }
 
+// -------------------------------------------------------------------
+// Silo-5: commit-log buffer + group-commit persist path.
+// -------------------------------------------------------------------
+
+/// One on-log entry for a Silo commit. A transaction with a write set
+/// of size `k` produces `k` `LogEntry`s, all stamped with the same
+/// commit epoch. The logger streams these into the WAL, one block
+/// each, and the commit's epoch is the ordering key that `persist`
+/// publishes as the new `durable_epoch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogEntry {
+    pub epoch: u32,
+    pub key: Key,
+    pub value: u64,
+}
+
+impl LogEntry {
+    const EMPTY: Self = Self {
+        epoch: 0,
+        key: [0; 8],
+        value: 0,
+    };
+}
+
+/// Per-worker commit-log buffer capacity. A worker that fills the
+/// buffer must cooperate with the logger (drain + flush) before
+/// attempting another commit. 256 entries at 24 bytes each is 6 KiB
+/// per buffer — small enough to live per-CPU alongside `TxnState`.
+pub const LOG_BUFFER_CAP: usize = 256;
+
+/// Signals that a [`LogBuffer`] is full and cannot accept more
+/// entries. The caller must persist (drain + flush) before retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogOverflow;
+
+/// Per-worker, single-producer commit-log buffer. A worker pushes
+/// entries after each successful commit; the logger takes an immutable
+/// view via [`LogBuffer::as_slice`], writes every entry to the WAL,
+/// then calls [`LogBuffer::clear`] to free the slots.
+///
+/// Ownership is strictly single-threaded: each CPU owns its own
+/// buffer. The logger executes on one CPU at a time and must hold
+/// exclusive access to any buffer it drains (see [`persist`] for the
+/// intended usage pattern).
+pub struct LogBuffer {
+    entries: [LogEntry; LOG_BUFFER_CAP],
+    count: u32,
+}
+
+impl LogBuffer {
+    pub const fn new() -> Self {
+        Self {
+            entries: [LogEntry::EMPTY; LOG_BUFFER_CAP],
+            count: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        LOG_BUFFER_CAP
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.count as usize == LOG_BUFFER_CAP
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[LogEntry] {
+        &self.entries[..self.count as usize]
+    }
+
+    /// Drop every buffered entry. Called by the logger after the
+    /// entries are durable on the WAL — before that point clearing
+    /// would drop log records that still need to be written.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
+    /// Append a single entry. Returns [`LogOverflow`] when the buffer
+    /// is already full; the caller must drain + flush before retrying.
+    pub fn push(&mut self, entry: LogEntry) -> Result<(), LogOverflow> {
+        if self.is_full() {
+            return Err(LogOverflow);
+        }
+        let idx = self.count as usize;
+        self.entries[idx] = entry;
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Append every write from a committed transaction. All entries
+    /// share `epoch`, the TID's epoch at commit time (not the worker's
+    /// start epoch — `persist` relies on this being the commit's
+    /// durability epoch). Either the whole batch lands or the buffer
+    /// stays unchanged, so a partially-logged commit can never leak
+    /// into the WAL.
+    pub fn record_commit(
+        &mut self,
+        epoch: u32,
+        writes: &[WriteEntry],
+    ) -> Result<(), LogOverflow> {
+        if self.count as usize + writes.len() > LOG_BUFFER_CAP {
+            return Err(LogOverflow);
+        }
+        for w in writes {
+            // Pre-checked; `push` cannot fail in this loop.
+            self.push(LogEntry {
+                epoch,
+                key: w.key,
+                value: w.new_value,
+            })
+            .expect("pre-checked capacity must hold");
+        }
+        Ok(())
+    }
+}
+
+impl Default for LogBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Abort helper: release the first `locked` entries of the write set
 /// in reverse acquisition order, restoring each record's pre-lock TID
 /// verbatim.
@@ -801,6 +936,83 @@ mod tests {
 
         let outcome = unsafe { commit(&mut txn) };
         assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    }
+
+    #[test]
+    fn log_buffer_push_and_drain_round_trip() {
+        let mut buf = LogBuffer::new();
+        assert!(buf.is_empty());
+
+        buf.push(LogEntry { epoch: 3, key: *b"k0______", value: 10 })
+            .unwrap();
+        buf.push(LogEntry { epoch: 3, key: *b"k1______", value: 20 })
+            .unwrap();
+        assert_eq!(buf.len(), 2);
+
+        let view = buf.as_slice();
+        assert_eq!(view[0].value, 10);
+        assert_eq!(view[1].key, *b"k1______");
+
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.as_slice().len(), 0);
+    }
+
+    #[test]
+    fn log_buffer_rejects_overflow() {
+        let mut buf = LogBuffer::new();
+        for i in 0..LOG_BUFFER_CAP as u64 {
+            buf.push(LogEntry { epoch: 1, key: i.to_be_bytes(), value: i })
+                .unwrap();
+        }
+        assert!(buf.is_full());
+        assert_eq!(
+            buf.push(LogEntry { epoch: 1, key: [0; 8], value: 0 }),
+            Err(LogOverflow),
+        );
+    }
+
+    #[test]
+    fn record_commit_is_atomic_across_full_boundary() {
+        // A batch that would overflow must leave the buffer untouched,
+        // otherwise the logger would observe a half-logged commit and
+        // the WAL would go out of sync with the commit's write set.
+        let mut buf = LogBuffer::new();
+        for i in 0..(LOG_BUFFER_CAP - 1) as u64 {
+            buf.push(LogEntry { epoch: 1, key: i.to_be_bytes(), value: i })
+                .unwrap();
+        }
+        let len_before = buf.len();
+
+        // Two-write commit. Only one slot remains — the batch must
+        // reject as a whole.
+        let r0 = Record::new(Tid::new(1, 0), 0);
+        let r1 = Record::new(Tid::new(1, 0), 0);
+        let writes = [
+            WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1 },
+            WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2 },
+        ];
+        assert_eq!(buf.record_commit(5, &writes), Err(LogOverflow));
+        assert_eq!(buf.len(), len_before, "partial write must not land");
+    }
+
+    #[test]
+    fn record_commit_stamps_every_write_with_commit_epoch() {
+        // All entries from one commit must share the commit's epoch,
+        // because `persist` later uses that epoch as the durability
+        // boundary.
+        let mut buf = LogBuffer::new();
+        let r0 = Record::new(Tid::new(1, 0), 0);
+        let r1 = Record::new(Tid::new(1, 0), 0);
+        let writes = [
+            WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1 },
+            WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2 },
+        ];
+        buf.record_commit(17, &writes).unwrap();
+        assert_eq!(buf.len(), 2);
+        for e in buf.as_slice() {
+            assert_eq!(e.epoch, 17);
+        }
     }
 
     #[test]
