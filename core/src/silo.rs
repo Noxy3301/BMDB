@@ -31,6 +31,11 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// 8-byte key used by the commit-log plumbing. Matches
+/// [`crate::wal::Key`]; kept as a local alias so this module does not
+/// depend on the WAL's import surface.
+pub type Key = [u8; 8];
+
 /// Global epoch counter. Starts at 1 so that TID epoch 0 is reserved
 /// for "never committed" records and never returned by
 /// [`advance_epoch`] during normal operation.
@@ -244,12 +249,14 @@ pub struct ReadEntry {
     pub tid_at_read: Tid,
 }
 
-/// One entry of a transaction's write set: which record to update and
-/// the value to install on commit. The lock/install sequence in the
-/// commit protocol walks this list.
+/// One entry of a transaction's write set: which record to update, the
+/// value to install on commit, and the key that identifies the record
+/// in the log. The lock/install sequence in the commit protocol walks
+/// this list; `key` is only consumed later by the commit-log path.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteEntry {
     pub record_addr: usize,
+    pub key: Key,
     pub new_value: u64,
 }
 
@@ -263,6 +270,7 @@ impl ReadEntry {
 impl WriteEntry {
     const EMPTY: Self = Self {
         record_addr: 0,
+        key: [0; 8],
         new_value: 0,
     };
 }
@@ -323,10 +331,19 @@ impl TxnState {
     /// sorted-lock pass would see two entries for one record and
     /// self-abort on the second `try_lock`. Returning the existing
     /// slot also matches most APIs' last-writer-wins expectation.
-    pub fn add_write(&mut self, record: &Record, new_value: u64) -> Result<(), TxnError> {
+    ///
+    /// `key` is carried as metadata for the commit-log path; it does
+    /// not participate in lock acquisition or read validation.
+    pub fn add_write(
+        &mut self,
+        record: &Record,
+        key: Key,
+        new_value: u64,
+    ) -> Result<(), TxnError> {
         let addr = record as *const Record as usize;
         for slot in &mut self.write_set[..self.write_count as usize] {
             if slot.record_addr == addr {
+                slot.key = key;
                 slot.new_value = new_value;
                 return Ok(());
             }
@@ -337,6 +354,7 @@ impl TxnState {
         let idx = self.write_count as usize;
         self.write_set[idx] = WriteEntry {
             record_addr: addr,
+            key,
             new_value,
         };
         self.write_count += 1;
@@ -608,7 +626,7 @@ mod tests {
         let r0 = Record::new(Tid::new(1, 0), 10);
         let mut t = TxnState::new(0);
         t.add_read(&r0, Tid::new(1, 0)).unwrap();
-        t.add_write(&r0, 99).unwrap();
+        t.add_write(&r0, [0; 8], 99).unwrap();
         assert_eq!(t.read_entries().len(), 1);
         assert_eq!(t.write_entries().len(), 1);
         assert_eq!(t.write_entries()[0].new_value, 99);
@@ -639,9 +657,12 @@ mod tests {
             .collect();
         let mut t = TxnState::new(0);
         for rec in &pool[..MAX_RW_SET] {
-            t.add_write(rec, 0).unwrap();
+            t.add_write(rec, [0; 8], 0).unwrap();
         }
-        assert_eq!(t.add_write(&pool[MAX_RW_SET], 0), Err(TxnError::WriteSetOverflow));
+        assert_eq!(
+            t.add_write(&pool[MAX_RW_SET], [0; 8], 0),
+            Err(TxnError::WriteSetOverflow),
+        );
         assert_eq!(t.write_entries().len(), MAX_RW_SET);
     }
 
@@ -650,7 +671,7 @@ mod tests {
         let r = Record::new(Tid::new(1, 0), 0);
         let mut t = TxnState::new(0);
         t.add_read(&r, Tid::new(1, 0)).unwrap();
-        t.add_write(&r, 99).unwrap();
+        t.add_write(&r, [0; 8], 99).unwrap();
         t.reset(42);
         assert_eq!(t.start_epoch(), 42);
         assert_eq!(t.read_entries().len(), 0);
@@ -664,7 +685,7 @@ mod tests {
 
         let mut txn = TxnState::new(current_epoch());
         txn.add_read(&r, observed_tid).unwrap();
-        txn.add_write(&r, 99).unwrap();
+        txn.add_write(&r, [0; 8], 99).unwrap();
 
         let outcome = unsafe { commit(&mut txn) };
         match outcome {
@@ -708,19 +729,36 @@ mod tests {
         let _held = r.try_lock().unwrap();
 
         let mut txn = TxnState::new(current_epoch());
-        txn.add_write(&r, 99).unwrap();
+        txn.add_write(&r, [0; 8], 99).unwrap();
 
         let outcome = unsafe { commit(&mut txn) };
         assert_eq!(outcome, CommitOutcome::AbortedLockConflict);
     }
 
     #[test]
+    fn write_entry_preserves_key_for_log_path() {
+        // The commit-log path reads `key` back from the write set to
+        // stream records into the WAL. Coalescing a second write onto
+        // the same record must update the key as well, so the logged
+        // entry reflects the last-writer-wins identity.
+        let r = Record::new(Tid::new(current_epoch(), 0), 0);
+        let mut t = TxnState::new(current_epoch());
+        t.add_write(&r, *b"first___", 1).unwrap();
+        assert_eq!(t.write_entries()[0].key, *b"first___");
+
+        t.add_write(&r, *b"second__", 2).unwrap();
+        assert_eq!(t.write_entries().len(), 1);
+        assert_eq!(t.write_entries()[0].key, *b"second__");
+        assert_eq!(t.write_entries()[0].new_value, 2);
+    }
+
+    #[test]
     fn add_write_coalesces_duplicates_last_writer_wins() {
         let r = Record::new(Tid::new(current_epoch(), 0), 0);
         let mut t = TxnState::new(current_epoch());
-        t.add_write(&r, 1).unwrap();
-        t.add_write(&r, 2).unwrap();
-        t.add_write(&r, 3).unwrap();
+        t.add_write(&r, [0; 8], 1).unwrap();
+        t.add_write(&r, [0; 8], 2).unwrap();
+        t.add_write(&r, [0; 8], 3).unwrap();
         assert_eq!(t.write_entries().len(), 1);
         assert_eq!(t.write_entries()[0].new_value, 3);
     }
@@ -736,7 +774,7 @@ mod tests {
 
         let mut txn = TxnState::new(current_epoch());
         txn.add_read(&r, observed).unwrap();
-        txn.add_write(&r, 7).unwrap();
+        txn.add_write(&r, [0; 8], 7).unwrap();
 
         let outcome = unsafe { commit(&mut txn) };
         assert_eq!(outcome, CommitOutcome::AbortedSequenceExhausted);
@@ -758,7 +796,7 @@ mod tests {
         let mut recs = [&a, &b, &c];
         recs.sort_by(|x, y| (*y as *const Record).cmp(&(*x as *const Record)));
         for (i, rec) in recs.iter().enumerate() {
-            txn.add_write(rec, 100 + i as u64).unwrap();
+            txn.add_write(rec, [0; 8], 100 + i as u64).unwrap();
         }
 
         let outcome = unsafe { commit(&mut txn) };
