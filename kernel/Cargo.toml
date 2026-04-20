@@ -35,12 +35,12 @@ run-args = [
     "-serial", "stdio",
     "-display", "none",
     "-smp", "4",
+    # KVM + host CPU passthrough. The silo-bench numbers without this
+    # flag carry a ~17x TCG emulation penalty that drowns OCC hot
+    # paths — keep it on by default. Requires `/dev/kvm` access; if
+    # `Could not access KVM kernel module: Permission denied` fires,
+    # `sudo usermod -aG kvm $USER` then log out and back in.
+    "-enable-kvm", "-cpu", "host",
     "-drive", "file=nvme.img,format=raw,if=none,id=nvme0",
     "-device", "nvme,serial=BMDB0001,drive=nvme0",
 ]
-
-# To measure on KVM instead of TCG (host CPU passthrough, ~50-100x
-# faster for tight atomic loops): add the user to the `kvm` group
-# (`sudo usermod -aG kvm $USER`, log out and back in) and run with
-# `cargo ksilobench -- -enable-kvm -cpu host`. bootimage forwards
-# unknown args to QEMU, so no config change is needed.
