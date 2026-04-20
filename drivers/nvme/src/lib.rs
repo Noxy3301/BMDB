@@ -317,16 +317,32 @@ impl Controller {
         Ok(())
     }
 
-    /// Write one block from `data` to namespace 1 at `lba`.
+    /// Write one block from `data` to namespace 1 at `lba`. Goes
+    /// through the static bounce buffer; prefer
+    /// `write_block_from_phys` when the caller already has a buffer
+    /// whose physical address is resolved, to avoid the extra memcpy.
     pub fn write_block(&mut self, lba: Lba, data: &[u8; BLOCK_SIZE]) -> Result<(), IoError> {
         unsafe {
             let buf = &mut (*(&raw mut DATA_BUF)).0;
             buf[..BLOCK_SIZE].copy_from_slice(data);
         }
+        // Safety: DATA_BUF's phys was resolved at init and is static.
+        unsafe { self.submit_write(lba, self.data_buf_phys) }
+    }
+
+    /// Zero-copy write. `phys` must be the physical address of a
+    /// `BLOCK_SIZE` region whose virtual mapping the caller keeps
+    /// alive until the submit/completion handshake returns. The
+    /// controller DMAs directly from `phys` without going through the
+    /// driver's bounce buffer.
+    ///
+    /// # Safety
+    /// See `BlockStorage::write_block_from_phys` contract.
+    unsafe fn submit_write(&mut self, lba: Lba, phys: u64) -> Result<(), IoError> {
         let mut cmd = EMPTY_SQE;
         cmd.cdw0 = 0x01; // I/O Write
         cmd.nsid = 1;
-        cmd.prp1 = self.data_buf_phys;
+        cmd.prp1 = phys;
         cmd.cdw10 = lba as u32;
         cmd.cdw11 = (lba >> 32) as u32;
         let cqe = submit(self.base, &mut self.io, cmd);
@@ -366,6 +382,17 @@ impl BlockStorage for Controller {
 
     fn write_block(&mut self, lba: Lba, data: &[u8; BLOCK_SIZE]) -> Result<(), Self::Error> {
         Controller::write_block(self, lba, data)
+    }
+
+    unsafe fn write_block_from_phys(
+        &mut self,
+        lba: Lba,
+        _vptr: *const [u8; BLOCK_SIZE],
+        phys: u64,
+    ) -> Result<(), Self::Error> {
+        // vptr is irrelevant once the caller has given us a resolved
+        // phys — the controller DMAs by physical address.
+        unsafe { self.submit_write(lba, phys) }
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {

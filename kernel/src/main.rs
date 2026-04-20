@@ -22,7 +22,7 @@ use bmdb_core::lba_alloc;
 use bmdb_serial::serial_println;
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use x86_64::{VirtAddr, registers::control::Cr3};
+use x86_64::{VirtAddr, registers::control::Cr3, structures::paging::Translate};
 
 entry_point!(kernel_main);
 
@@ -67,6 +67,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     bmdb_pci::scan_bus(0);
 
     let mut nvme = bmdb_nvme::init(phys_mem_offset, &mapper).expect("NVMe init failed");
+
+    // Zero-copy WAL path: resolve the physical address of the raw-
+    // block pool so `append_no_flush` can hand it straight to the
+    // NVMe controller as a PRP, skipping the driver's bounce buffer.
+    unsafe {
+        bmdb_core::wal::init_raw_pool(|vptr| {
+            mapper
+                .translate_addr(VirtAddr::new(vptr as u64))
+                .expect("WAL raw pool not mapped")
+                .as_u64()
+        });
+    }
 
     serial_println!(
         "LBA layout: superblock@{}, wal@{}..={} ({} blocks), data@{}..",

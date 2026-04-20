@@ -13,8 +13,76 @@
 //! The checksum is FNV-1a (32-bit). It is a correctness placeholder; a real
 //! WAL wants CRC32C both for stronger detection and for hardware acceleration.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::lba_alloc::{BLOCK_SIZE, Lba, WAL_START, wal_end};
 use crate::storage::BlockStorage;
+
+// -------------------------------------------------------------------
+// Zero-copy WAL block pool.
+//
+// `append_no_flush` encodes each record into a 512-byte block and
+// submits it to `BlockStorage`. The default path lives on the stack
+// and a DMA-backed storage has to memcpy it into its own buffer
+// before the device pulls it — two copies per record. The static pool
+// below lets the kernel resolve a phys address for a long-lived block
+// slot once at boot, so subsequent appends encode directly into a
+// buffer the controller can DMA out of (zero driver copy).
+//
+// A single slot is enough for the current single-threaded persist
+// path: `submit_write` in the NVMe driver spin-polls completion, so
+// the DMA is done before the slot is reused. A parallel persist path
+// would need a ring of slots with an atomic cursor.
+// -------------------------------------------------------------------
+
+#[repr(C, align(4096))]
+struct RawBlock([u8; BLOCK_SIZE]);
+
+static mut RAW_POOL: [RawBlock; 1] = [RawBlock([0u8; BLOCK_SIZE])];
+static mut RAW_POOL_PHYS: [u64; 1] = [0u64];
+static RAW_POOL_INITED: AtomicBool = AtomicBool::new(false);
+
+/// Resolve the physical address of every raw-block slot and mark the
+/// pool initialized. After this call, `append_no_flush` will encode
+/// records straight into the pool's virtual memory and hand the
+/// corresponding physical address to
+/// `BlockStorage::write_block_from_phys`.
+///
+/// # Safety
+/// - Must be called exactly once, on a single CPU, before any WAL
+///   `append` / `append_no_flush` on the zero-copy path.
+/// - `phys_of` must return the correct physical address for the given
+///   virtual pointer under the mapper the storage backend uses.
+pub unsafe fn init_raw_pool(mut phys_of: impl FnMut(*const u8) -> u64) {
+    const N: usize = 1;
+    // Safety: single-threaded init, caller's contract. Use raw
+    // pointers into the mutable statics so we never form a reference
+    // (Rust 2024 forbids shared references to mutable statics).
+    unsafe {
+        for i in 0..N {
+            let vptr = (&raw const RAW_POOL[i].0) as *const u8;
+            (&raw mut RAW_POOL_PHYS[i]).write(phys_of(vptr));
+        }
+    }
+    RAW_POOL_INITED.store(true, Ordering::Release);
+}
+
+/// Borrow the (vptr, phys) pair for slot 0. Callers must serialize
+/// access; with a single-slot pool and a spin-polled driver this is
+/// implicit — the caller returns from `write_block_from_phys` only
+/// after the DMA completes, so the slot is free again on the next
+/// iteration.
+fn raw_pool_slot() -> Option<(*mut [u8; BLOCK_SIZE], u64)> {
+    if !RAW_POOL_INITED.load(Ordering::Acquire) {
+        return None;
+    }
+    // Safety: pool memory has static lifetime; we return raw
+    // pointers, not references, so aliasing rules bend to the
+    // single-slot serialization described above.
+    let vptr = &raw mut RAW_POOL as *mut RawBlock as *mut [u8; BLOCK_SIZE];
+    let phys = unsafe { (&raw const RAW_POOL_PHYS[0]).read() };
+    Some((vptr, phys))
+}
 
 pub const WAL_MAGIC: u64 = 0x424D_4442_5741_4C30; // "BMDBWAL0"
 
@@ -190,6 +258,13 @@ impl Wal {
     /// issuing [`flush`](Self::flush) before treating any returned LSN as
     /// durable. Used by Silo group commit, where many records are written
     /// under a single epoch boundary and amortize one flush across them.
+    ///
+    /// If [`init_raw_pool`] has been called, the record is encoded
+    /// directly into a DMA-addressable slot and handed to the backend
+    /// as a physical address, skipping the driver-side bounce. Host
+    /// tests and any backend that doesn't override `write_block_from_phys`
+    /// fall back to a stack buffer — functionally identical, one extra
+    /// copy.
     pub fn append_no_flush<S: BlockStorage>(
         &mut self,
         storage: &mut S,
@@ -200,9 +275,24 @@ impl Wal {
     ) -> Result<u64, S::Error> {
         assert!(self.next_lba <= wal_end(), "WAL region is full");
         let rec = Record::new(op, self.next_lsn, epoch, key, value);
-        let mut block = [0u8; BLOCK_SIZE];
-        encode(&rec, &mut block);
-        storage.write_block(self.next_lba, &block)?;
+
+        match raw_pool_slot() {
+            Some((vptr, phys)) => {
+                // Safety: single-slot pool is serialized by the
+                // spin-polled driver, so no concurrent access here.
+                let block = unsafe { &mut *vptr };
+                encode(&rec, block);
+                unsafe {
+                    storage.write_block_from_phys(self.next_lba, vptr as *const _, phys)?;
+                }
+            }
+            None => {
+                let mut block = [0u8; BLOCK_SIZE];
+                encode(&rec, &mut block);
+                storage.write_block(self.next_lba, &block)?;
+            }
+        }
+
         let lsn = self.next_lsn;
         self.next_lba += 1;
         self.next_lsn += 1;
