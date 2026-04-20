@@ -158,9 +158,32 @@ impl Wal {
         key: Key,
         value: Value,
     ) -> Result<u64, S::Error> {
+        // Cursor snapshot so a flush failure leaves the WAL indistinguishable
+        // from the state before the call — a retry must land at the same
+        // LBA/LSN, not skip past a non-durable block.
+        let snap = self.snapshot();
         let lsn = self.append_no_flush(storage, op, epoch, key, value)?;
-        self.flush(storage)?;
+        if let Err(e) = self.flush(storage) {
+            self.restore(snap);
+            return Err(e);
+        }
         Ok(lsn)
+    }
+
+    /// Cursor snapshot — `(next_lba, next_lsn)`. Used by paths that batch
+    /// multiple appends under one flush and need to unwind on failure.
+    #[inline]
+    pub(crate) fn snapshot(&self) -> (Lba, u64) {
+        (self.next_lba, self.next_lsn)
+    }
+
+    /// Restore a prior cursor snapshot. Only safe when no durable record
+    /// sits between the snapshot and the current cursor — otherwise the
+    /// rewound cursor would overwrite a record recovery still trusts.
+    #[inline]
+    pub(crate) fn restore(&mut self, snap: (Lba, u64)) {
+        self.next_lba = snap.0;
+        self.next_lsn = snap.1;
     }
 
     /// Append one record *without* flushing. The caller is responsible for
@@ -380,6 +403,72 @@ mod tests {
     #[test]
     fn region_end_constants_are_self_consistent() {
         assert_eq!(wal_end(), WAL_START + crate::lba_alloc::WAL_LEN - 1);
+    }
+
+    /// BlockStorage wrapper that reports every operation as successful but
+    /// lets the test arm one flush to return an error. Used to exercise
+    /// cursor rollback without wiring a full failure model into MemStorage.
+    struct FailingFlushStorage<'a> {
+        inner: &'a mut MemStorage,
+        fail_next_flush: bool,
+    }
+
+    #[derive(Debug)]
+    struct SimulatedFailure;
+
+    impl BlockStorage for FailingFlushStorage<'_> {
+        type Error = SimulatedFailure;
+
+        fn read_block(
+            &mut self,
+            lba: Lba,
+            out: &mut [u8; BLOCK_SIZE],
+        ) -> Result<(), Self::Error> {
+            self.inner.read_block(lba, out).map_err(|_| SimulatedFailure)
+        }
+
+        fn write_block(
+            &mut self,
+            lba: Lba,
+            data: &[u8; BLOCK_SIZE],
+        ) -> Result<(), Self::Error> {
+            self.inner.write_block(lba, data).map_err(|_| SimulatedFailure)
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            if self.fail_next_flush {
+                self.fail_next_flush = false;
+                return Err(SimulatedFailure);
+            }
+            self.inner.flush().map_err(|_| SimulatedFailure)
+        }
+    }
+
+    #[test]
+    fn append_rewinds_cursor_on_flush_failure() {
+        // Cursor rollback gate: if flush fails, a retry must land at the
+        // exact same LBA/LSN. Otherwise a non-durable block would be
+        // skipped over and the next successful append would leave a gap.
+        let mut backing = MemStorage::new();
+        let mut wal = Wal::new();
+        let cursor_before = wal.snapshot();
+
+        let mut storage = FailingFlushStorage {
+            inner: &mut backing,
+            fail_next_flush: true,
+        };
+        let err = wal.append(&mut storage, Op::Put, 0, *b"k_______", *b"v_______");
+        assert!(err.is_err(), "primed failure must surface");
+        assert_eq!(
+            wal.snapshot(),
+            cursor_before,
+            "cursor must unwind so the next append reuses the same slot",
+        );
+
+        // Retrying with a healed storage lands at the original LSN.
+        let retry_lsn = wal.append(&mut storage, Op::Put, 0, *b"k_______", *b"v_______").unwrap();
+        assert_eq!(retry_lsn, 1);
+        assert_eq!(wal.next_lsn(), 2);
     }
 
     #[test]

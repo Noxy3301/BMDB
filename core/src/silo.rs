@@ -513,19 +513,20 @@ pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
 
 /// One on-log entry for a Silo commit. A transaction with a write set
 /// of size `k` produces `k` `LogEntry`s, all stamped with the same
-/// commit epoch. The logger streams these into the WAL, one block
-/// each, and the commit's epoch is the ordering key that `persist`
-/// publishes as the new `durable_epoch`.
+/// commit `Tid`. The logger streams these into the WAL (one block
+/// each), and the full Tid gives recovery a total order across every
+/// worker's buffer — sorting by `tid.raw()` reproduces Silo's commit
+/// order even when `persist` drains buffers out of order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogEntry {
-    pub epoch: u32,
+    pub tid: Tid,
     pub key: Key,
     pub value: u64,
 }
 
 impl LogEntry {
     const EMPTY: Self = Self {
-        epoch: 0,
+        tid: Tid::from_raw(0),
         key: [0; 8],
         value: 0,
     };
@@ -610,14 +611,13 @@ impl LogBuffer {
     }
 
     /// Append every write from a committed transaction. All entries
-    /// share `epoch`, the TID's epoch at commit time (not the worker's
-    /// start epoch — `persist` relies on this being the commit's
-    /// durability epoch). Either the whole batch lands or the buffer
+    /// share `commit_tid`, the TID that [`commit`] minted — Silo's
+    /// total ordering key. Either the whole batch lands or the buffer
     /// stays unchanged, so a partially-logged commit can never leak
     /// into the WAL.
     pub fn record_commit(
         &mut self,
-        epoch: u32,
+        commit_tid: Tid,
         writes: &[WriteEntry],
     ) -> Result<(), LogOverflow> {
         if self.count as usize + writes.len() > LOG_BUFFER_CAP {
@@ -626,7 +626,7 @@ impl LogBuffer {
         for w in writes {
             // Pre-checked; `push` cannot fail in this loop.
             self.push(LogEntry {
-                epoch,
+                tid: commit_tid,
                 key: w.key,
                 value: w.new_value,
             })
@@ -690,19 +690,29 @@ pub fn persist<S: BlockStorage>(
     wal: &mut Wal,
     buffers: &mut [&mut LogBuffer],
 ) -> Result<u32, S::Error> {
+    // Cursor snapshot — any error below unwinds to this point so the
+    // buffers stay authoritative and a retry fills the same WAL slots.
+    let cursor = wal.snapshot();
     let mut max_epoch: u32 = 0;
     let mut total: u32 = 0;
 
     for buf in buffers.iter() {
         for entry in buf.as_slice() {
-            wal.append_no_flush(
+            // Store the full commit Tid in the record's `epoch` slot so
+            // recovery has a total order across all loggers. Tid bits
+            // are `[epoch:32 | sequence:29 | status:3]`, so an ascending
+            // sort by the u64 is exactly the Silo serialization order.
+            if let Err(e) = wal.append_no_flush(
                 storage,
                 Op::Put,
-                entry.epoch as u64,
+                entry.tid.raw(),
                 entry.key,
                 entry.value.to_be_bytes(),
-            )?;
-            max_epoch = max_epoch.max(entry.epoch);
+            ) {
+                wal.restore(cursor);
+                return Err(e);
+            }
+            max_epoch = max_epoch.max(entry.tid.epoch());
             total += 1;
         }
     }
@@ -711,7 +721,10 @@ pub fn persist<S: BlockStorage>(
         return Ok(durable_epoch());
     }
 
-    wal.flush(storage)?;
+    if let Err(e) = wal.flush(storage) {
+        wal.restore(cursor);
+        return Err(e);
+    }
 
     // fetch_max so concurrent persist callers never regress the
     // boundary. `AcqRel` publishes every WAL write to later
@@ -723,6 +736,43 @@ pub fn persist<S: BlockStorage>(
     }
 
     Ok(durable_epoch())
+}
+
+/// Read every log record on disk and return them in Silo commit order.
+///
+/// The WAL is a physical sequence — records land in `persist` iteration
+/// order, which says nothing about the commit serialization across
+/// workers. Silo recovery restores consistency by sorting on
+/// `tid.raw()`: the Tid layout `[epoch:32 | sequence:29 | status:3]`
+/// makes an unsigned compare equivalent to `(epoch, sequence)` order,
+/// and the commit protocol guarantees distinct commits mint strictly
+/// increasing Tids (read + write set force `new_seq > max_seen_seq`).
+///
+/// Test-only for now because stable sort in `no_std` requires either
+/// a fixed-size scratch array or an external allocator. Bench + real
+/// recovery will need an in-crate variant; for feasibility the host
+/// test is enough to prove the protocol is sound.
+#[cfg(test)]
+pub fn recover_in_commit_order<S: BlockStorage>(
+    storage: &mut S,
+) -> Result<std::vec::Vec<LogEntry>, S::Error> {
+    use crate::lba_alloc::WAL_START;
+
+    let wal = Wal::recover(storage)?;
+    let mut out: std::vec::Vec<LogEntry> = std::vec::Vec::new();
+    let mut lba = WAL_START;
+    while lba < wal.next_lba() {
+        let rec = Wal::read_at(storage, lba)?
+            .expect("recovered LBA is guaranteed to decode by Wal::recover contract");
+        out.push(LogEntry {
+            tid: Tid::from_raw(rec.epoch),
+            key: rec.key,
+            value: u64::from_be_bytes(rec.value),
+        });
+        lba += 1;
+    }
+    out.sort_unstable_by_key(|e| e.tid.raw());
+    Ok(out)
 }
 
 /// Abort helper: release the first `locked` entries of the write set
@@ -1029,9 +1079,9 @@ mod tests {
         let mut buf = LogBuffer::new();
         assert!(buf.is_empty());
 
-        buf.push(LogEntry { epoch: 3, key: *b"k0______", value: 10 })
+        buf.push(LogEntry { tid: Tid::new(3, 1), key: *b"k0______", value: 10 })
             .unwrap();
-        buf.push(LogEntry { epoch: 3, key: *b"k1______", value: 20 })
+        buf.push(LogEntry { tid: Tid::new(3, 2), key: *b"k1______", value: 20 })
             .unwrap();
         assert_eq!(buf.len(), 2);
 
@@ -1048,12 +1098,16 @@ mod tests {
     fn log_buffer_rejects_overflow() {
         let mut buf = LogBuffer::new();
         for i in 0..LOG_BUFFER_CAP as u64 {
-            buf.push(LogEntry { epoch: 1, key: i.to_be_bytes(), value: i })
-                .unwrap();
+            buf.push(LogEntry {
+                tid: Tid::new(1, i as u32),
+                key: i.to_be_bytes(),
+                value: i,
+            })
+            .unwrap();
         }
         assert!(buf.is_full());
         assert_eq!(
-            buf.push(LogEntry { epoch: 1, key: [0; 8], value: 0 }),
+            buf.push(LogEntry { tid: Tid::new(1, 0), key: [0; 8], value: 0 }),
             Err(LogOverflow),
         );
     }
@@ -1065,8 +1119,12 @@ mod tests {
         // the WAL would go out of sync with the commit's write set.
         let mut buf = LogBuffer::new();
         for i in 0..(LOG_BUFFER_CAP - 1) as u64 {
-            buf.push(LogEntry { epoch: 1, key: i.to_be_bytes(), value: i })
-                .unwrap();
+            buf.push(LogEntry {
+                tid: Tid::new(1, i as u32),
+                key: i.to_be_bytes(),
+                value: i,
+            })
+            .unwrap();
         }
         let len_before = buf.len();
 
@@ -1078,15 +1136,15 @@ mod tests {
             WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1 },
             WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2 },
         ];
-        assert_eq!(buf.record_commit(5, &writes), Err(LogOverflow));
+        assert_eq!(buf.record_commit(Tid::new(5, 1), &writes), Err(LogOverflow));
         assert_eq!(buf.len(), len_before, "partial write must not land");
     }
 
     #[test]
-    fn record_commit_stamps_every_write_with_commit_epoch() {
-        // All entries from one commit must share the commit's epoch,
-        // because `persist` later uses that epoch as the durability
-        // boundary.
+    fn record_commit_stamps_every_write_with_commit_tid() {
+        // All entries from one commit must share the commit's TID —
+        // recovery uses `tid.raw()` as the total-order sort key across
+        // loggers, so a split TID would reorder a commit's own writes.
         let mut buf = LogBuffer::new();
         let r0 = Record::new(Tid::new(1, 0), 0);
         let r1 = Record::new(Tid::new(1, 0), 0);
@@ -1094,10 +1152,11 @@ mod tests {
             WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1 },
             WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2 },
         ];
-        buf.record_commit(17, &writes).unwrap();
+        let commit_tid = Tid::new(17, 42);
+        buf.record_commit(commit_tid, &writes).unwrap();
         assert_eq!(buf.len(), 2);
         for e in buf.as_slice() {
-            assert_eq!(e.epoch, 17);
+            assert_eq!(e.tid, commit_tid);
         }
     }
 
@@ -1125,8 +1184,12 @@ mod tests {
         let mut wal = Wal::new();
         let mut buf = LogBuffer::new();
         for i in 1..=3u64 {
-            buf.push(LogEntry { epoch: 5, key: i.to_be_bytes(), value: i })
-                .unwrap();
+            buf.push(LogEntry {
+                tid: Tid::new(5, i as u32),
+                key: i.to_be_bytes(),
+                value: i,
+            })
+            .unwrap();
         }
 
         persist(&mut storage, &mut wal, &mut [&mut buf]).unwrap();
@@ -1144,9 +1207,13 @@ mod tests {
         let mut wal = Wal::new();
 
         let mut buf_low = LogBuffer::new();
-        buf_low.push(LogEntry { epoch: 100, key: [0; 8], value: 0 }).unwrap();
+        buf_low
+            .push(LogEntry { tid: Tid::new(100, 1), key: [0; 8], value: 0 })
+            .unwrap();
         let mut buf_high = LogBuffer::new();
-        buf_high.push(LogEntry { epoch: 200, key: [1; 8], value: 1 }).unwrap();
+        buf_high
+            .push(LogEntry { tid: Tid::new(200, 1), key: [1; 8], value: 1 })
+            .unwrap();
 
         let before = durable_epoch();
         let after = persist(
@@ -1161,7 +1228,9 @@ mod tests {
         // Draining a batch whose max epoch is below the current boundary
         // must not drop the boundary.
         let mut buf_old = LogBuffer::new();
-        buf_old.push(LogEntry { epoch: 50, key: [2; 8], value: 2 }).unwrap();
+        buf_old
+            .push(LogEntry { tid: Tid::new(50, 1), key: [2; 8], value: 2 })
+            .unwrap();
         let after2 = persist(&mut storage, &mut wal, &mut [&mut buf_old]).unwrap();
         assert_eq!(after2, after, "lower-epoch batch must not move boundary");
     }
@@ -1175,9 +1244,15 @@ mod tests {
         let mut buf_a = LogBuffer::new();
         let mut buf_b = LogBuffer::new();
 
-        buf_a.push(LogEntry { epoch: 7, key: *b"alpha___", value: 1 }).unwrap();
-        buf_a.push(LogEntry { epoch: 7, key: *b"bravo___", value: 2 }).unwrap();
-        buf_b.push(LogEntry { epoch: 8, key: *b"charlie_", value: 3 }).unwrap();
+        buf_a
+            .push(LogEntry { tid: Tid::new(7, 1), key: *b"alpha___", value: 1 })
+            .unwrap();
+        buf_a
+            .push(LogEntry { tid: Tid::new(7, 2), key: *b"bravo___", value: 2 })
+            .unwrap();
+        buf_b
+            .push(LogEntry { tid: Tid::new(8, 1), key: *b"charlie_", value: 3 })
+            .unwrap();
 
         persist(&mut storage, &mut wal, &mut [&mut buf_a, &mut buf_b]).unwrap();
 
@@ -1195,9 +1270,76 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 3);
-        assert!(seen.iter().any(|e| e.1 == *b"alpha___" && e.0 == 7));
-        assert!(seen.iter().any(|e| e.1 == *b"bravo___" && e.0 == 7));
-        assert!(seen.iter().any(|e| e.1 == *b"charlie_" && e.0 == 8));
+        // The `epoch` field now carries Tid::raw(); check the upper 32
+        // bits against the commit epoch to be tolerant of sequence bits.
+        assert!(
+            seen.iter()
+                .any(|e| e.1 == *b"alpha___" && Tid::from_raw(e.0).epoch() == 7)
+        );
+        assert!(
+            seen.iter()
+                .any(|e| e.1 == *b"bravo___" && Tid::from_raw(e.0).epoch() == 7)
+        );
+        assert!(
+            seen.iter()
+                .any(|e| e.1 == *b"charlie_" && Tid::from_raw(e.0).epoch() == 8)
+        );
+    }
+
+    #[test]
+    fn recovery_sorts_by_commit_tid_across_drain_order() {
+        // Two commits touch the same key. Commit A runs first (lower
+        // TID), commit B runs second (higher TID). Their log entries
+        // land in separate worker buffers. The logger drains buf_B
+        // BEFORE buf_A, so the WAL holds B's record at a lower LBA
+        // than A's — the opposite of commit order.
+        //
+        // A naive LSN-ordered replay would land A after B and report
+        // the older value as final state. Silo-correct replay sorts by
+        // `tid.raw()` and must report B's value.
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        let mut buf_a = LogBuffer::new();
+        let mut buf_b = LogBuffer::new();
+
+        let r_k = Record::new(Tid::new(current_epoch(), 0), 0);
+        let key_k = *b"key_K___";
+
+        let mut txn_a = TxnState::new(current_epoch());
+        txn_a.add_write(&r_k, key_k, 100).unwrap();
+        let tid_a = match unsafe { commit(&mut txn_a) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("txn A did not commit: {:?}", other),
+        };
+        buf_a.record_commit(tid_a, txn_a.write_entries()).unwrap();
+
+        let mut txn_b = TxnState::new(current_epoch());
+        txn_b.add_write(&r_k, key_k, 200).unwrap();
+        let tid_b = match unsafe { commit(&mut txn_b) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("txn B did not commit: {:?}", other),
+        };
+        buf_b.record_commit(tid_b, txn_b.write_entries()).unwrap();
+
+        assert!(
+            tid_b.raw() > tid_a.raw(),
+            "test precondition: B's TID must outrank A's",
+        );
+
+        // Drain B before A — WAL physical order inverts commit order.
+        persist(&mut storage, &mut wal, &mut [&mut buf_b, &mut buf_a]).unwrap();
+
+        let replay = recover_in_commit_order(&mut storage).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].tid, tid_a, "sort must put A's entry first");
+        assert_eq!(replay[1].tid, tid_b, "B's entry comes second by TID");
+        assert_eq!(
+            replay.last().unwrap().value,
+            200,
+            "last-writer-wins over commit-ordered replay picks B",
+        );
     }
 
     #[test]
@@ -1225,27 +1367,27 @@ mod tests {
         let mut txn = TxnState::new(current_epoch());
         txn.add_write(&r_a, key_a, 11).unwrap();
         txn.add_write(&r_b, key_b, 22).unwrap();
-        let commit_epoch_1 = match unsafe { commit(&mut txn) } {
-            CommitOutcome::Committed { new_tid } => new_tid.epoch(),
+        let tid_1 = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
             other => panic!("txn 1 did not commit: {:?}", other),
         };
-        buf.record_commit(commit_epoch_1, txn.write_entries()).unwrap();
+        buf.record_commit(tid_1, txn.write_entries()).unwrap();
 
         // Txn 2: overwrite B, write C. Simulates a later epoch if the
         // global has advanced; if not, both land at the same epoch.
         txn.reset(current_epoch());
         txn.add_write(&r_b, key_b, 222).unwrap();
         txn.add_write(&r_c, key_c, 33).unwrap();
-        let commit_epoch_2 = match unsafe { commit(&mut txn) } {
-            CommitOutcome::Committed { new_tid } => new_tid.epoch(),
+        let tid_2 = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
             other => panic!("txn 2 did not commit: {:?}", other),
         };
-        buf.record_commit(commit_epoch_2, txn.write_entries()).unwrap();
+        buf.record_commit(tid_2, txn.write_entries()).unwrap();
 
         // One flush covers every log entry from both commits.
         persist(&mut storage, &mut wal, &mut [&mut buf]).unwrap();
         assert_eq!(storage.flush_count(), 1);
-        assert!(durable_epoch() >= commit_epoch_2);
+        assert!(durable_epoch() >= tid_2.epoch());
 
         // "Crash": throw away wal, buf, and the records. Only storage
         // remains. Recovery rebuilds the on-disk state from scratch.
@@ -1255,21 +1397,15 @@ mod tests {
         drop(r_b);
         drop(r_c);
 
-        let recovered = Wal::recover(&mut storage).unwrap();
-        assert_eq!(recovered.next_lsn(), 5, "4 log records, next LSN = 5");
-
-        // Replay: build a key→value map by walking the log in LSN order.
-        // Each entry's value overwrites any prior entry for the same key,
-        // matching Silo's last-writer-wins recovery semantics.
-        use crate::lba_alloc::WAL_START;
+        // Replay in Silo commit order — entries sort by `tid.raw()`, so
+        // last-writer-wins over the result is the final committed state.
         use std::collections::HashMap;
+        let replay = recover_in_commit_order(&mut storage).unwrap();
+        assert_eq!(replay.len(), 4);
+
         let mut state: HashMap<[u8; 8], u64> = HashMap::new();
-        let mut lba = WAL_START;
-        while lba < recovered.next_lba() {
-            let rec = Wal::read_at(&mut storage, lba).unwrap().unwrap();
-            let value = u64::from_be_bytes(rec.value);
-            state.insert(rec.key, value);
-            lba += 1;
+        for entry in &replay {
+            state.insert(entry.key, entry.value);
         }
 
         assert_eq!(state.get(&key_a).copied(), Some(11));
