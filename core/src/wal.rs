@@ -144,13 +144,30 @@ impl Wal {
         self.next_lsn
     }
 
-    /// Append one record. The call flushes before returning, so the record is
-    /// durable by the time the caller sees the LSN. Group-commit (one flush
-    /// per epoch) is a Silo-era optimization.
+    /// Append one record and flush. The record is durable by the time the
+    /// caller sees the LSN. Single-record durability — used by the Phase 3
+    /// KV path where every `put` is its own transaction.
     ///
     /// Panics if the WAL region is full — a circular log / checkpoint +
     /// truncate story is a later phase problem.
     pub fn append<S: BlockStorage>(
+        &mut self,
+        storage: &mut S,
+        op: Op,
+        epoch: u64,
+        key: Key,
+        value: Value,
+    ) -> Result<u64, S::Error> {
+        let lsn = self.append_no_flush(storage, op, epoch, key, value)?;
+        self.flush(storage)?;
+        Ok(lsn)
+    }
+
+    /// Append one record *without* flushing. The caller is responsible for
+    /// issuing [`flush`](Self::flush) before treating any returned LSN as
+    /// durable. Used by Silo group commit, where many records are written
+    /// under a single epoch boundary and amortize one flush across them.
+    pub fn append_no_flush<S: BlockStorage>(
         &mut self,
         storage: &mut S,
         op: Op,
@@ -163,11 +180,16 @@ impl Wal {
         let mut block = [0u8; BLOCK_SIZE];
         encode(&rec, &mut block);
         storage.write_block(self.next_lba, &block)?;
-        storage.flush()?;
         let lsn = self.next_lsn;
         self.next_lba += 1;
         self.next_lsn += 1;
         Ok(lsn)
+    }
+
+    /// Explicit durability barrier. After this returns, every prior
+    /// `append_no_flush` on the same storage is durable.
+    pub fn flush<S: BlockStorage>(&mut self, storage: &mut S) -> Result<(), S::Error> {
+        storage.flush()
     }
 
     /// Rebuild the WAL cursor by scanning from the start of the region. Stops
@@ -358,5 +380,28 @@ mod tests {
     #[test]
     fn region_end_constants_are_self_consistent() {
         assert_eq!(wal_end(), WAL_START + crate::lba_alloc::WAL_LEN - 1);
+    }
+
+    #[test]
+    fn batched_append_no_flush_amortizes_one_flush() {
+        // Silo group-commit path: N appends, one flush. The on-disk state
+        // must match an equivalent sequence of eager appends, with the
+        // flush count collapsed from N to 1.
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+
+        for i in 1..=5u64 {
+            wal.append_no_flush(&mut storage, Op::Put, 0, i.to_be_bytes(), [0; 8])
+                .unwrap();
+        }
+        assert_eq!(storage.flush_count(), 0, "batched path must defer durability");
+
+        wal.flush(&mut storage).unwrap();
+        assert_eq!(storage.flush_count(), 1, "a single flush must cover the whole batch");
+
+        // Every record is recoverable, same as if `append` had been used.
+        let recovered = Wal::recover(&mut storage).unwrap();
+        assert_eq!(recovered.next_lsn(), 6);
+        assert_eq!(recovered.next_lba(), WAL_START + 5);
     }
 }
