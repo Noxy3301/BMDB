@@ -104,6 +104,15 @@ static STATS: [WorkerStats; MAX_CPUS] = {
 /// BSP polls this counter, then drains every buffer and prints stats.
 static WORKERS_ONLINE: AtomicU32 = AtomicU32::new(0);
 
+/// Bitmap of `cpu_index` values that entered `ap_worker`. Stored as a
+/// u64 because `MAX_CPUS = 64` — bit `i` is set when the worker with
+/// `cpu_index == i` is live. `smp::init` assigns `cpu_index` in wake
+/// order, skipping APs that time out, so the live set may be sparse
+/// (e.g. `{0, 1, 3}` if AP with cpu_index 2 never came up). Iterating
+/// this bitmap is the only correct way to visit every worker's slot;
+/// a dense `0..online_aps()` range would silently drop entries.
+static LIVE_CPU_MASK: AtomicU64 = AtomicU64::new(0);
+
 /// Start barrier. Each worker ticks `WORKERS_READY` on entry, then
 /// spins until `GO` turns true — the BSP releases the barrier after
 /// `smp::init` has signalled every AP, so every worker begins its
@@ -129,6 +138,11 @@ pub fn ap_worker(cpu_index: usize) {
     let log = unsafe { &mut *log_ptr };
 
     let stats = &STATS[cpu_index];
+
+    // Publish this CPU's bit so BSP's aggregation loop can find our
+    // slot even when the wake order leaves `cpu_index` sparse.
+    assert!(cpu_index < 64, "silo-bench bitmap is u64-wide; MAX_CPUS must fit");
+    LIVE_CPU_MASK.fetch_or(1u64 << cpu_index, Ordering::Release);
 
     // Start barrier: wait for every worker to reach this point and
     // the BSP to flip `GO`. Without it, workers woken earlier would
@@ -266,14 +280,21 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
         core::hint::spin_loop();
     }
 
-    // Aggregate per-worker numbers.
+    // Aggregate per-worker numbers. Iterate the live-CPU bitmap, not
+    // a dense `0..total_workers` range: `smp::init` advances its
+    // `ap_index` past timed-out APs, so live `cpu_index` values can
+    // be sparse and a dense walk would drop real workers' stats.
+    let live_mask = LIVE_CPU_MASK.load(Ordering::Acquire);
     let mut total_commits: u64 = 0;
     let mut total_lock: u64 = 0;
     let mut total_read: u64 = 0;
     let mut total_seq: u64 = 0;
     let mut total_cycles: u64 = 0;
     let mut total_overflows: u64 = 0;
-    for i in 0..(total_workers as usize) {
+    for i in 0..MAX_CPUS {
+        if live_mask & (1u64 << i) == 0 {
+            continue;
+        }
         let s = &STATS[i];
         let c = s.commits.load(Ordering::Acquire);
         let al = s.aborts_lock.load(Ordering::Acquire);
@@ -335,11 +356,8 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     );
 
     let t0 = rdtsc();
-    let mut buffer_refs = [core::ptr::null_mut::<LogBuffer>(); MAX_CPUS];
-    for i in 0..(total_workers as usize) {
-        buffer_refs[i] = WORKERS[i].log.get();
-    }
-    let (persist_result, logged) = drain_and_persist(nvme, &mut wal, &buffer_refs[..total_workers as usize]);
+    let (persist_result, logged) =
+        unsafe { drain_live_buffers_and_persist(nvme, &mut wal, live_mask) };
     let persist_cycles = rdtsc().wrapping_sub(t0);
 
     match persist_result {
@@ -358,40 +376,56 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     );
 }
 
-/// Thin wrapper that turns the raw pointer array into the `&mut [&mut
-/// LogBuffer]` slice expected by `silo::persist`. Split out so the
-/// `unsafe` isolation is visible.
-fn drain_and_persist(
+/// Drain every live worker's log buffer (as given by `live_mask`)
+/// through one group-commit `silo::persist` call and return the per-
+/// batch summary.
+///
+/// # Safety
+/// Every AP bit set in `live_mask` must correspond to a worker that
+/// has already ticked `WORKERS_ONLINE` — i.e. finished its commit
+/// loop and parked in `hlt`. Without quiescence the exclusive
+/// references we take to each buffer would alias the worker's own
+/// access. The caller (BSP `run()`) establishes this with a barrier
+/// spin on `WORKERS_ONLINE >= total_workers`.
+unsafe fn drain_live_buffers_and_persist(
     nvme: &mut bmdb_nvme::Controller,
     wal: &mut Wal,
-    buffer_ptrs: &[*mut LogBuffer],
+    live_mask: u64,
 ) -> (Result<u32, bmdb_nvme::IoError>, u64) {
-    // Build a `[&mut LogBuffer; N]` on the stack. MAX_CPUS is fixed at
-    // 64, so this array is always large enough.
-    let mut refs: [Option<&mut LogBuffer>; MAX_CPUS] = [const { None }; MAX_CPUS];
+    use core::mem::MaybeUninit;
+
+    // Stack-allocated scratch holding one `&mut LogBuffer` per live
+    // CPU. MaybeUninit lets us fill only the first `count` slots and
+    // hand a well-typed slice to `silo::persist` without building an
+    // `Option`-based shadow array.
+    let mut refs: [MaybeUninit<&mut LogBuffer>; MAX_CPUS] =
+        [const { MaybeUninit::uninit() }; MAX_CPUS];
+    let mut count: usize = 0;
     let mut total_records: u64 = 0;
-    for (i, ptr) in buffer_ptrs.iter().enumerate() {
-        // Safety: the BSP is the sole writer at this point; every AP
-        // has parked in `hlt` and published its buffer state via
-        // WORKERS_ONLINE's Release.
-        let buf = unsafe { &mut **ptr };
-        total_records += buf.len() as u64;
-        refs[i] = Some(buf);
-    }
-    // Flatten to the exact slice length persist expects.
-    let mut flattened: [*mut LogBuffer; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
-    for (i, opt) in refs.iter_mut().enumerate() {
-        if let Some(b) = opt.take() {
-            flattened[i] = b as *mut LogBuffer;
+
+    for cpu in 0..MAX_CPUS {
+        if live_mask & (1u64 << cpu) == 0 {
+            continue;
         }
+        // Safety: `WORKERS[cpu].log.get()` gives a `*mut LogBuffer`
+        // that is uniquely owned by cpu `cpu`'s worker. That worker
+        // has parked — see function-level safety comment — so we can
+        // take a non-aliasing `&mut`. Each iteration produces a
+        // distinct slot pointer, so the multiple `&mut`s we collect
+        // do not alias each other either.
+        let buf = unsafe { &mut *WORKERS[cpu].log.get() };
+        total_records += buf.len() as u64;
+        refs[count].write(buf);
+        count += 1;
     }
-    // Final cast back to `&mut [&mut LogBuffer]` — safe because we
-    // just built these mutable references from unique buffers.
-    let n = buffer_ptrs.len();
+
+    // Cast the initialized prefix of `refs` to `&mut [&mut LogBuffer]`
+    // — same layout, same lifetime, only the element type drops the
+    // `MaybeUninit` wrapper.
     let slice = unsafe {
         core::slice::from_raw_parts_mut(
-            flattened.as_mut_ptr() as *mut &mut LogBuffer,
-            n,
+            refs.as_mut_ptr() as *mut &mut LogBuffer,
+            count,
         )
     };
     (silo::persist(nvme, wal, slice), total_records)
