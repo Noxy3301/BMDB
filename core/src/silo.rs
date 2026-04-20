@@ -31,6 +31,9 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::storage::BlockStorage;
+use crate::wal::{Op, Wal};
+
 /// 8-byte key used by the commit-log plumbing. Matches
 /// [`crate::wal::Key`]; kept as a local alias so this module does not
 /// depend on the WAL's import surface.
@@ -639,6 +642,89 @@ impl Default for LogBuffer {
     }
 }
 
+/// Highest epoch whose log entries are durable on the WAL.
+///
+/// Starts at 0 (no committed txn is durable yet; epoch 0 never stamps
+/// a TID, so this is a clean "nothing durable" sentinel). Workers that
+/// need to delay a client ack until their commit is durable compare
+/// their commit epoch against [`durable_epoch`] and wait until the
+/// atomic catches up.
+static DURABLE_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// Current durable epoch. Every epoch `E <= durable_epoch()` has had
+/// its log records flushed to stable storage. `Acquire` pairs with the
+/// `Release` store inside [`persist`].
+#[inline]
+pub fn durable_epoch() -> u32 {
+    DURABLE_EPOCH.load(Ordering::Acquire)
+}
+
+/// Drain every buffered log entry into the WAL and publish the
+/// resulting durability boundary.
+///
+/// Steps, in order:
+/// 1. Walk each buffer, appending every entry to the WAL without
+///    flushing (one NVMe block each) and tracking the highest epoch
+///    seen across all entries.
+/// 2. Issue a single `flush` — this is the I/O-amortization win.
+///    Before this returns, every prior `append_no_flush` is durable.
+/// 3. Publish the new durability boundary via `DURABLE_EPOCH` with a
+///    `Release` store; readers pair with `durable_epoch()`'s
+///    `Acquire`.
+/// 4. Clear each buffer.
+///
+/// Synchronization contract — the single-logger simplification: the
+/// caller must guarantee that no live commit is buffering a log entry
+/// with an epoch less than or equal to the one that this call is about
+/// to publish. Silo's paper resolves this with per-worker heartbeats
+/// and a min-over-workers fence; the feasibility bench satisfies it by
+/// quiescing workers while `persist` runs.
+///
+/// On an I/O error mid-batch, the function returns early without
+/// flushing and without clearing buffers — the WAL may hold partial
+/// log entries on disk, but `durable_epoch` stays pinned at its prior
+/// value so no caller observes bogus durability. Recovery replays what
+/// landed and skips the torn tail.
+pub fn persist<S: BlockStorage>(
+    storage: &mut S,
+    wal: &mut Wal,
+    buffers: &mut [&mut LogBuffer],
+) -> Result<u32, S::Error> {
+    let mut max_epoch: u32 = 0;
+    let mut total: u32 = 0;
+
+    for buf in buffers.iter() {
+        for entry in buf.as_slice() {
+            wal.append_no_flush(
+                storage,
+                Op::Put,
+                entry.epoch as u64,
+                entry.key,
+                entry.value.to_be_bytes(),
+            )?;
+            max_epoch = max_epoch.max(entry.epoch);
+            total += 1;
+        }
+    }
+
+    if total == 0 {
+        return Ok(durable_epoch());
+    }
+
+    wal.flush(storage)?;
+
+    // fetch_max so concurrent persist callers never regress the
+    // boundary. `AcqRel` publishes every WAL write to later
+    // `durable_epoch()` readers.
+    DURABLE_EPOCH.fetch_max(max_epoch, Ordering::AcqRel);
+
+    for buf in buffers.iter_mut() {
+        buf.clear();
+    }
+
+    Ok(durable_epoch())
+}
+
 /// Abort helper: release the first `locked` entries of the write set
 /// in reverse acquisition order, restoring each record's pre-lock TID
 /// verbatim.
@@ -1013,6 +1099,105 @@ mod tests {
         for e in buf.as_slice() {
             assert_eq!(e.epoch, 17);
         }
+    }
+
+    #[test]
+    fn persist_empty_buffers_is_a_no_op_on_storage() {
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        let mut buf = LogBuffer::new();
+        let boundary_before = durable_epoch();
+
+        let boundary = persist(&mut storage, &mut wal, &mut [&mut buf]).unwrap();
+
+        assert_eq!(boundary, boundary_before, "empty drain must not move the boundary");
+        assert_eq!(storage.flush_count(), 0, "empty drain must not flush");
+        assert_eq!(wal.next_lsn(), 1);
+    }
+
+    #[test]
+    fn persist_amortizes_one_flush_across_batch() {
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        let mut buf = LogBuffer::new();
+        for i in 1..=3u64 {
+            buf.push(LogEntry { epoch: 5, key: i.to_be_bytes(), value: i })
+                .unwrap();
+        }
+
+        persist(&mut storage, &mut wal, &mut [&mut buf]).unwrap();
+
+        assert_eq!(storage.flush_count(), 1, "one flush per persist, not per entry");
+        assert_eq!(wal.next_lsn(), 4, "three entries each bumped LSN");
+        assert!(buf.is_empty(), "successful persist must clear buffers");
+    }
+
+    #[test]
+    fn persist_advances_durable_epoch_monotonically() {
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+
+        let mut buf_low = LogBuffer::new();
+        buf_low.push(LogEntry { epoch: 100, key: [0; 8], value: 0 }).unwrap();
+        let mut buf_high = LogBuffer::new();
+        buf_high.push(LogEntry { epoch: 200, key: [1; 8], value: 1 }).unwrap();
+
+        let before = durable_epoch();
+        let after = persist(
+            &mut storage,
+            &mut wal,
+            &mut [&mut buf_low, &mut buf_high],
+        )
+        .unwrap();
+        assert!(after >= 200, "boundary must reach max epoch drained");
+        assert!(after >= before, "fetch_max must never regress");
+
+        // Draining a batch whose max epoch is below the current boundary
+        // must not drop the boundary.
+        let mut buf_old = LogBuffer::new();
+        buf_old.push(LogEntry { epoch: 50, key: [2; 8], value: 2 }).unwrap();
+        let after2 = persist(&mut storage, &mut wal, &mut [&mut buf_old]).unwrap();
+        assert_eq!(after2, after, "lower-epoch batch must not move boundary");
+    }
+
+    #[test]
+    fn persist_emits_wal_records_readable_by_recover() {
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        let mut buf_a = LogBuffer::new();
+        let mut buf_b = LogBuffer::new();
+
+        buf_a.push(LogEntry { epoch: 7, key: *b"alpha___", value: 1 }).unwrap();
+        buf_a.push(LogEntry { epoch: 7, key: *b"bravo___", value: 2 }).unwrap();
+        buf_b.push(LogEntry { epoch: 8, key: *b"charlie_", value: 3 }).unwrap();
+
+        persist(&mut storage, &mut wal, &mut [&mut buf_a, &mut buf_b]).unwrap();
+
+        // Recover the WAL cursor from scratch and walk every record.
+        use crate::lba_alloc::WAL_START;
+        let recovered = Wal::recover(&mut storage).unwrap();
+        assert_eq!(recovered.next_lsn(), 4);
+
+        let mut seen: std::vec::Vec<(u64, [u8; 8], [u8; 8])> = std::vec::Vec::new();
+        let mut lba = WAL_START;
+        while lba < recovered.next_lba() {
+            let rec = Wal::read_at(&mut storage, lba).unwrap().unwrap();
+            seen.push((rec.epoch, rec.key, rec.value));
+            lba += 1;
+        }
+
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().any(|e| e.1 == *b"alpha___" && e.0 == 7));
+        assert!(seen.iter().any(|e| e.1 == *b"bravo___" && e.0 == 7));
+        assert!(seen.iter().any(|e| e.1 == *b"charlie_" && e.0 == 8));
     }
 
     #[test]
