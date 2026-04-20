@@ -18,6 +18,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 
+use bmdb_core::bench::compute_stats;
 use bmdb_core::silo::{
     self, CommitOutcome, LogBuffer, Record, Tid, TxnState, current_epoch, durable_epoch,
 };
@@ -30,7 +31,7 @@ use crate::acpi::MAX_CPUS;
 /// each worker sees a blend of uncontended fast paths and contended
 /// abort paths. Larger `RECORDS` reduces contention; smaller `TXNS`
 /// keeps the total runtime inside QEMU's default patience.
-pub const RECORDS: usize = 16;
+pub const RECORDS: usize = 256;
 pub const TXNS_PER_WORKER: usize = 500;
 pub const READS_PER_TXN: usize = 4;
 pub const WRITES_PER_TXN: usize = 2;
@@ -78,10 +79,17 @@ struct WorkerStats {
     aborts_read: AtomicU64,
     aborts_seq: AtomicU64,
     commit_cycles: AtomicU64,
+    abort_cycles: AtomicU64,
     /// Log-buffer overflow events. Each one means an OCC-committed
     /// transaction whose write set could not be recorded — the Record
     /// atomics reflect the commit, but recovery would not replay it.
     log_overflows: AtomicU64,
+    /// TSC at the first instruction of the commit loop and at the
+    /// last. `max(loop_end) - min(loop_start)` across live CPUs
+    /// gives the bench's wall-clock equivalent in cycles — divide by
+    /// a clock frequency to get seconds.
+    loop_start_tsc: AtomicU64,
+    loop_end_tsc: AtomicU64,
 }
 
 impl WorkerStats {
@@ -91,9 +99,33 @@ impl WorkerStats {
         aborts_read: AtomicU64::new(0),
         aborts_seq: AtomicU64::new(0),
         commit_cycles: AtomicU64::new(0),
+        abort_cycles: AtomicU64::new(0),
         log_overflows: AtomicU64::new(0),
+        loop_start_tsc: AtomicU64::new(0),
+        loop_end_tsc: AtomicU64::new(0),
     };
 }
+
+/// Per-CPU latency sample buffer. One entry per attempted commit
+/// (committed or aborted), in TSC cycles. The single-writer-per-slot
+/// invariant (only the CPU whose `cpu_index` matches writes here)
+/// makes `UnsafeCell` safe; BSP reads after every worker publishes
+/// `WORKERS_ONLINE`.
+#[repr(C, align(64))]
+struct LatencySlot {
+    samples: UnsafeCell<[u64; TXNS_PER_WORKER]>,
+}
+
+// Safety: same invariant as `WorkerSlot` — only the owning CPU writes,
+// and BSP only reads after the WORKERS_ONLINE happens-before edge.
+unsafe impl Sync for LatencySlot {}
+
+static LATENCY_SAMPLES: [LatencySlot; MAX_CPUS] = {
+    const EMPTY: LatencySlot = LatencySlot {
+        samples: UnsafeCell::new([0u64; TXNS_PER_WORKER]),
+    };
+    [EMPTY; MAX_CPUS]
+};
 
 static STATS: [WorkerStats; MAX_CPUS] = {
     const EMPTY: WorkerStats = WorkerStats::EMPTY;
@@ -138,6 +170,9 @@ pub fn ap_worker(cpu_index: usize) {
     let log = unsafe { &mut *log_ptr };
 
     let stats = &STATS[cpu_index];
+    // Safety: single-writer-per-cpu_index invariant. See LatencySlot
+    // Sync impl.
+    let samples = unsafe { &mut *LATENCY_SAMPLES[cpu_index].samples.get() };
 
     // Publish this CPU's bit so BSP's aggregation loop can find our
     // slot even when the wake order leaves `cpu_index` sparse.
@@ -153,11 +188,14 @@ pub fn ap_worker(cpu_index: usize) {
         core::hint::spin_loop();
     }
 
-    for _ in 0..TXNS_PER_WORKER {
+    stats.loop_start_tsc.store(rdtsc(), Ordering::Relaxed);
+
+    for i in 0..TXNS_PER_WORKER {
         txn.reset(current_epoch());
         let t0 = rdtsc();
         let outcome = run_one_txn(txn, &mut rng);
         let elapsed = rdtsc().wrapping_sub(t0);
+        samples[i] = elapsed;
 
         match outcome {
             CommitOutcome::Committed { new_tid } => {
@@ -174,18 +212,23 @@ pub fn ap_worker(cpu_index: usize) {
             }
             CommitOutcome::AbortedLockConflict => {
                 stats.aborts_lock.fetch_add(1, Ordering::Relaxed);
+                stats.abort_cycles.fetch_add(elapsed, Ordering::Relaxed);
             }
             CommitOutcome::AbortedReadChanged => {
                 stats.aborts_read.fetch_add(1, Ordering::Relaxed);
+                stats.abort_cycles.fetch_add(elapsed, Ordering::Relaxed);
             }
             CommitOutcome::AbortedSequenceExhausted => {
                 stats.aborts_seq.fetch_add(1, Ordering::Relaxed);
+                stats.abort_cycles.fetch_add(elapsed, Ordering::Relaxed);
             }
         }
     }
 
+    stats.loop_end_tsc.store(rdtsc(), Ordering::Relaxed);
+
     // Release so the BSP's `Acquire` load of WORKERS_ONLINE sees all
-    // updates to this worker's stats / buffer.
+    // updates to this worker's stats / buffer / latency samples.
     WORKERS_ONLINE.fetch_add(1, Ordering::Release);
 }
 
@@ -289,8 +332,12 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     let mut total_lock: u64 = 0;
     let mut total_read: u64 = 0;
     let mut total_seq: u64 = 0;
-    let mut total_cycles: u64 = 0;
+    let mut total_commit_cycles: u64 = 0;
+    let mut total_abort_cycles: u64 = 0;
     let mut total_overflows: u64 = 0;
+    let mut wall_start: u64 = u64::MAX;
+    let mut wall_end: u64 = 0;
+
     for i in 0..MAX_CPUS {
         if live_mask & (1u64 << i) == 0 {
             continue;
@@ -300,43 +347,85 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
         let al = s.aborts_lock.load(Ordering::Acquire);
         let ar = s.aborts_read.load(Ordering::Acquire);
         let aseq = s.aborts_seq.load(Ordering::Acquire);
-        let cyc = s.commit_cycles.load(Ordering::Acquire);
+        let ccyc = s.commit_cycles.load(Ordering::Acquire);
+        let acyc = s.abort_cycles.load(Ordering::Acquire);
         let lov = s.log_overflows.load(Ordering::Acquire);
+        let lst = s.loop_start_tsc.load(Ordering::Acquire);
+        let let_ = s.loop_end_tsc.load(Ordering::Acquire);
+
+        // Per-CPU percentile summary. Safety: samples owned by this
+        // CPU's slot; every worker is parked. `compute_stats` sorts
+        // in place, which is the intended consume-once pattern.
+        let samples = unsafe { &mut *LATENCY_SAMPLES[i].samples.get() };
+        let per_cpu = compute_stats(samples);
+
+        let mean_commit = if c > 0 { ccyc / c } else { 0 };
+        let mean_abort_n = al + ar + aseq;
+        let mean_abort = if mean_abort_n > 0 { acyc / mean_abort_n } else { 0 };
+
         serial_println!(
-            "SILO-BENCH cpu{} commits={} aborts(lock/read/seq)={}/{}/{} log_overflows={} cycles={}",
-            i,
-            c,
-            al,
-            ar,
-            aseq,
-            lov,
-            cyc,
+            "SILO-BENCH cpu{} commits={} aborts(lock/read/seq)={}/{}/{} log_overflows={} \
+             mean_commit_cycles={} mean_abort_cycles={}",
+            i, c, al, ar, aseq, lov, mean_commit, mean_abort,
         );
+        serial_println!(
+            "SILO-BENCH cpu{} latency {}",
+            i, per_cpu,
+        );
+
         total_commits += c;
         total_lock += al;
         total_read += ar;
         total_seq += aseq;
-        total_cycles += cyc;
+        total_commit_cycles += ccyc;
+        total_abort_cycles += acyc;
         total_overflows += lov;
+        if lst != 0 && lst < wall_start {
+            wall_start = lst;
+        }
+        if let_ > wall_end {
+            wall_end = let_;
+        }
     }
 
-    let total_attempts =
-        total_commits + total_lock + total_read + total_seq;
+    let total_attempts = total_commits + total_lock + total_read + total_seq;
     let mean_commit_cycles = if total_commits > 0 {
-        total_cycles / total_commits
+        total_commit_cycles / total_commits
     } else {
         0
     };
+    let total_aborts = total_attempts - total_commits;
+    let mean_abort_cycles = if total_aborts > 0 {
+        total_abort_cycles / total_aborts
+    } else {
+        0
+    };
+    let wall_cycles = if wall_end > wall_start { wall_end - wall_start } else { 0 };
+    // TPS assuming a 1 GHz TSC. Multiply by the real GHz rate to
+    // rescale. QEMU TCG TSC is not a true clock, so treat this number
+    // as "per-cycle throughput, expressed in GHz-equivalents."
+    let tps_at_1ghz = if wall_cycles > 0 {
+        total_commits.saturating_mul(1_000_000_000) / wall_cycles
+    } else {
+        0
+    };
+
     serial_println!(
-        "SILO-BENCH total attempts={} commits={} aborts={} (lock={} read={} seq={}) log_overflows={} mean_commit_cycles={}",
+        "SILO-BENCH total attempts={} commits={} aborts={} (lock={} read={} seq={}) \
+         log_overflows={} mean_commit_cycles={} mean_abort_cycles={}",
         total_attempts,
         total_commits,
-        total_attempts - total_commits,
+        total_aborts,
         total_lock,
         total_read,
         total_seq,
         total_overflows,
         mean_commit_cycles,
+        mean_abort_cycles,
+    );
+    serial_println!(
+        "SILO-BENCH wall_cycles={} tps_at_1ghz={} (scale by actual GHz)",
+        wall_cycles, tps_at_1ghz,
     );
 
     // Group commit pass: drain every worker's buffer through one flush.
