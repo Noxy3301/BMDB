@@ -475,14 +475,27 @@ pub extern "C" fn ap_main(cpu_index: u64) -> ! {
     // Silo OCC workload so BSP orchestration can collect per-AP commit
     // / abort counters; without the feature the plain atomic RMW loop
     // still guarantees SMP is live.
+    //
+    // Ordering of ONLINE_APS vs. the workload differs by feature. For
+    // the contention smoke the BSP's SMP-f gate reads the counter sum
+    // once every AP has finished its RMW loop, so the signal must wait
+    // until the loop completes. For silo-bench the workload itself is
+    // what we want to run in parallel across APs, so the signal has to
+    // fire early — otherwise `smp::init`'s serial wake-up would wait
+    // for each AP's full commit loop before starting the next one and
+    // the bench would degenerate into a sequence of single-CPU runs.
     #[cfg(not(feature = "silo-bench"))]
-    for _ in 0..CONTENTION_ITERS {
-        CONTENTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    {
+        for _ in 0..CONTENTION_ITERS {
+            CONTENTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        }
+        ONLINE_APS.fetch_add(1, Ordering::Release);
     }
     #[cfg(feature = "silo-bench")]
-    crate::silo_bench::ap_worker(cpu_index as usize);
-
-    ONLINE_APS.fetch_add(1, Ordering::Release);
+    {
+        ONLINE_APS.fetch_add(1, Ordering::Release);
+        crate::silo_bench::ap_worker(cpu_index as usize);
+    }
     // Park the AP. Interrupts are masked from the trampoline's `cli`,
     // so `hlt` parks the core indefinitely.
     loop {

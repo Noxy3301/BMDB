@@ -30,8 +30,8 @@ use crate::acpi::MAX_CPUS;
 /// each worker sees a blend of uncontended fast paths and contended
 /// abort paths. Larger `RECORDS` reduces contention; smaller `TXNS`
 /// keeps the total runtime inside QEMU's default patience.
-pub const RECORDS: usize = 256;
-pub const TXNS_PER_WORKER: usize = 10_000;
+pub const RECORDS: usize = 16;
+pub const TXNS_PER_WORKER: usize = 500;
 pub const READS_PER_TXN: usize = 4;
 pub const WRITES_PER_TXN: usize = 2;
 
@@ -78,6 +78,10 @@ struct WorkerStats {
     aborts_read: AtomicU64,
     aborts_seq: AtomicU64,
     commit_cycles: AtomicU64,
+    /// Log-buffer overflow events. Each one means an OCC-committed
+    /// transaction whose write set could not be recorded — the Record
+    /// atomics reflect the commit, but recovery would not replay it.
+    log_overflows: AtomicU64,
 }
 
 impl WorkerStats {
@@ -87,6 +91,7 @@ impl WorkerStats {
         aborts_read: AtomicU64::new(0),
         aborts_seq: AtomicU64::new(0),
         commit_cycles: AtomicU64::new(0),
+        log_overflows: AtomicU64::new(0),
     };
 }
 
@@ -98,6 +103,15 @@ static STATS: [WorkerStats; MAX_CPUS] = {
 /// Workers that have finished their run and parked themselves. The
 /// BSP polls this counter, then drains every buffer and prints stats.
 static WORKERS_ONLINE: AtomicU32 = AtomicU32::new(0);
+
+/// Start barrier. Each worker ticks `WORKERS_READY` on entry, then
+/// spins until `GO` turns true — the BSP releases the barrier after
+/// `smp::init` has signalled every AP, so every worker begins its
+/// commit loop within a few hundred cycles of the others rather than
+/// staggered over the SMP bring-up timeline.
+static WORKERS_READY: AtomicU32 = AtomicU32::new(0);
+static GO: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// AP entry for the Silo bench. Replaces the SMP-f contention loop
 /// under `--features silo-bench`.
@@ -116,6 +130,15 @@ pub fn ap_worker(cpu_index: usize) {
 
     let stats = &STATS[cpu_index];
 
+    // Start barrier: wait for every worker to reach this point and
+    // the BSP to flip `GO`. Without it, workers woken earlier would
+    // finish their commit loop before workers woken later had even
+    // started, making the bench a sequence of single-CPU runs.
+    WORKERS_READY.fetch_add(1, Ordering::Release);
+    while !GO.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
     for _ in 0..TXNS_PER_WORKER {
         txn.reset(current_epoch());
         let t0 = rdtsc();
@@ -126,11 +149,14 @@ pub fn ap_worker(cpu_index: usize) {
             CommitOutcome::Committed { new_tid } => {
                 stats.commits.fetch_add(1, Ordering::Relaxed);
                 stats.commit_cycles.fetch_add(elapsed, Ordering::Relaxed);
-                // Log path. If the buffer fills we drop this batch on
-                // the floor — bench workers can't call persist(), that
-                // would require coordinating with the BSP. A production
-                // path would either block or trigger a logger hand-off.
-                let _ = log.record_commit(new_tid, txn.write_entries());
+                // Log path. If the buffer fills, count the overflow so
+                // the report can flag durability loss. A production
+                // path would either block the worker or hand off to a
+                // logger; the feasibility bench treats the overflow as
+                // an OCC-committed-but-not-durable event.
+                if log.record_commit(new_tid, txn.write_entries()).is_err() {
+                    stats.log_overflows.fetch_add(1, Ordering::Relaxed);
+                }
             }
             CommitOutcome::AbortedLockConflict => {
                 stats.aborts_lock.fetch_add(1, Ordering::Relaxed);
@@ -217,10 +243,23 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     // `ap_worker`; the BSP itself is also a worker in this bench, so
     // we add 1. On QEMU -smp 4 with 3 APs online, expected_workers=3
     // and we wait for WORKERS_ONLINE == 4.
+    let total_workers = expected_workers + 1;
     let my_cpu = unsafe { crate::percpu::current().cpu_index } as usize;
+
+    // BSP also counts toward `WORKERS_READY`. Without this tick the
+    // barrier release condition would miss the BSP and all APs would
+    // hang on `GO`. The subsequent loop is the BSP's referee role:
+    // once every worker (including the BSP) is ready, flip `GO` so
+    // everyone starts their commit loop within a handful of cycles of
+    // one another.
+    WORKERS_READY.fetch_add(1, Ordering::Release);
+    while WORKERS_READY.load(Ordering::Acquire) < total_workers {
+        core::hint::spin_loop();
+    }
+    GO.store(true, Ordering::Release);
+
     ap_worker(my_cpu);
 
-    let total_workers = expected_workers + 1;
     // Spin until every worker has published its stats. APs are already
     // hlt'd so this is a quick bounded wait.
     while WORKERS_ONLINE.load(Ordering::Acquire) < total_workers {
@@ -233,6 +272,7 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     let mut total_read: u64 = 0;
     let mut total_seq: u64 = 0;
     let mut total_cycles: u64 = 0;
+    let mut total_overflows: u64 = 0;
     for i in 0..(total_workers as usize) {
         let s = &STATS[i];
         let c = s.commits.load(Ordering::Acquire);
@@ -240,13 +280,15 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
         let ar = s.aborts_read.load(Ordering::Acquire);
         let aseq = s.aborts_seq.load(Ordering::Acquire);
         let cyc = s.commit_cycles.load(Ordering::Acquire);
+        let lov = s.log_overflows.load(Ordering::Acquire);
         serial_println!(
-            "SILO-BENCH cpu{} commits={} aborts(lock/read/seq)={}/{}/{} cycles={}",
+            "SILO-BENCH cpu{} commits={} aborts(lock/read/seq)={}/{}/{} log_overflows={} cycles={}",
             i,
             c,
             al,
             ar,
             aseq,
+            lov,
             cyc,
         );
         total_commits += c;
@@ -254,6 +296,7 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
         total_read += ar;
         total_seq += aseq;
         total_cycles += cyc;
+        total_overflows += lov;
     }
 
     let total_attempts =
@@ -264,13 +307,14 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
         0
     };
     serial_println!(
-        "SILO-BENCH total attempts={} commits={} aborts={} (lock={} read={} seq={}) mean_commit_cycles={}",
+        "SILO-BENCH total attempts={} commits={} aborts={} (lock={} read={} seq={}) log_overflows={} mean_commit_cycles={}",
         total_attempts,
         total_commits,
         total_attempts - total_commits,
         total_lock,
         total_read,
         total_seq,
+        total_overflows,
         mean_commit_cycles,
     );
 

@@ -534,9 +534,10 @@ impl LogEntry {
 
 /// Per-worker commit-log buffer capacity. A worker that fills the
 /// buffer must cooperate with the logger (drain + flush) before
-/// attempting another commit. 256 entries at 24 bytes each is 6 KiB
-/// per buffer — small enough to live per-CPU alongside `TxnState`.
-pub const LOG_BUFFER_CAP: usize = 256;
+/// attempting another commit. 4096 entries at 24 bytes each is 96 KiB
+/// per buffer — fits a feasibility-sized benchmark run (thousands of
+/// txns × a handful of writes) without an in-run logger.
+pub const LOG_BUFFER_CAP: usize = 4096;
 
 /// Signals that a [`LogBuffer`] is full and cannot accept more
 /// entries. The caller must persist (drain + flush) before retrying.

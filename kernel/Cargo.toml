@@ -34,6 +34,7 @@ bmdb-nvme.workspace = true
 run-args = [
     "-serial", "stdio",
     "-display", "none",
+    "-smp", "4",
     "-drive", "file=nvme.img,format=raw,if=none,id=nvme0",
     "-device", "nvme,serial=BMDB0001,drive=nvme0",
 ]
