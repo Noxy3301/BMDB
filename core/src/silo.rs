@@ -74,6 +74,24 @@ pub fn advance_epoch() -> u32 {
     GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
 }
 
+/// Raise the global epoch to at least `epoch` if it is behind. Recovery
+/// calls this so transactions committed after a restart mint TIDs that
+/// outrank every recovered record's epoch.
+pub fn ensure_epoch_at_least(epoch: u32) {
+    let mut cur = GLOBAL_EPOCH.load(Ordering::Acquire);
+    while cur < epoch {
+        match GLOBAL_EPOCH.compare_exchange_weak(
+            cur,
+            epoch,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 /// Transaction identifier, packed in a single `u64`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tid(u64);
@@ -223,6 +241,18 @@ impl Record {
         debug_assert!(!new_tid.is_locked());
         self.value.store(new_value, Ordering::Release);
         self.tid.store(new_tid.raw(), Ordering::Release);
+    }
+
+    /// Overwrite the value and TID directly, bypassing the lock protocol.
+    /// For single-threaded recovery only, replaying a committed version
+    /// into a fresh record before the store is opened to transactions.
+    ///
+    /// # Safety
+    /// Caller must guarantee exclusive access — no concurrent reader or
+    /// writer — which holds during engine recovery.
+    pub unsafe fn restore(&self, tid: Tid, value: u64) {
+        self.value.store(value, Ordering::Release);
+        self.tid.store(tid.raw(), Ordering::Release);
     }
 
     /// Release the lock without changing the value. Restores
@@ -733,6 +763,15 @@ static DURABLE_EPOCH: AtomicU32 = AtomicU32::new(0);
 #[inline]
 pub fn durable_epoch() -> u32 {
     DURABLE_EPOCH.load(Ordering::Acquire)
+}
+
+/// Publish that every epoch `<= epoch` is durable, returning the new
+/// boundary. The engine's durable-commit path advances it after each
+/// flush; recovery advances it to the highest recovered epoch. `fetch_max`
+/// so concurrent callers never regress the boundary.
+pub fn mark_durable(epoch: u32) -> u32 {
+    DURABLE_EPOCH.fetch_max(epoch, Ordering::AcqRel);
+    durable_epoch()
 }
 
 /// Drain every buffered log entry into the WAL and publish the

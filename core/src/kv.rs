@@ -81,6 +81,12 @@ impl Kv {
                     // `Kv::delete` below.
                     let _ = tree.delete(rec.key);
                 }
+                Some(Op::Commit) => {
+                    // The single-writer KV never emits commit-boundary
+                    // records (those belong to the transaction engine's
+                    // grouped log). One here means the log is not a KV log.
+                    return Err(RecoverError::MalformedRecord);
+                }
                 None => {
                     return Err(RecoverError::MalformedRecord);
                 }

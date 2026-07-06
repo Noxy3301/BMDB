@@ -34,16 +34,35 @@
 //! of distinct keys; slot reclamation (EBR) and pool growth are later
 //! increments.
 //!
+//! Durability: [`Engine::transaction_durable`] logs a committed write set
+//! plus a commit-boundary record to the WAL and flushes once, so the
+//! whole transaction is durable atomically — a crash leaves either the
+//! full group or nothing that [`Engine::recover`] will apply. Durable
+//! commits are serialized under the WAL lock (held across precommit,
+//! append, and flush), so log order equals commit order and no
+//! transaction becomes durable ahead of one it read from; recovery then
+//! replays fully-committed groups in that order and discards a torn tail.
+//! One flush per commit is a correctness-first baseline — batched group
+//! commit is a later optimization. The in-memory [`Engine::transaction`]
+//! path stays for callers that do not need durability.
+//!
 //! Scope so far: point `get`/`put`/`delete` (tombstones) with
-//! read-your-writes, absent-read validation, and a bounded retry loop.
-//! Not yet here: durable commit (writes are in-memory only), range scans
-//! with phantom protection, and the concurrent index.
+//! read-your-writes, absent-read validation, a bounded retry loop, and
+//! durable multi-write commit with crash recovery. Not yet here: range
+//! scans with phantom protection, WAL space reclamation, and the
+//! concurrent index.
 //!
 //! [absent]: Tid::is_absent
 
 use crate::bptree::{BpTree, Key};
-use crate::silo::{self, CommitOutcome, Record, Tid, TxnState, current_epoch};
+use crate::lba_alloc::WAL_START;
+use crate::silo::{
+    self, CommitOutcome, MAX_RW_SET, Record, Tid, TxnState, current_epoch, ensure_epoch_at_least,
+    mark_durable,
+};
+use crate::storage::BlockStorage;
 use crate::sync::SpinLock;
+use crate::wal::{Op, Wal};
 
 /// Tuples the engine can hold. Bounds the static footprint (each
 /// [`Record`] is a 64-byte cache line, so this array is
@@ -119,6 +138,9 @@ struct Directory<I: Index> {
 pub struct Engine<I: Index = BpTreeIndex> {
     records: [Record; ENGINE_RECORDS],
     dir: SpinLock<Directory<I>>,
+    /// Write-ahead log cursor for durable commits. Guarded so concurrent
+    /// durable commits serialize their append + flush.
+    wal: SpinLock<Wal>,
 }
 
 impl Engine<BpTreeIndex> {
@@ -134,6 +156,7 @@ impl Engine<BpTreeIndex> {
                 index: BpTreeIndex::new(),
                 next_slot: 0,
             }),
+            wal: SpinLock::new(Wal::new()),
         }
     }
 }
@@ -175,6 +198,126 @@ impl<I: Index> Engine<I> {
             }
         }
         None
+    }
+
+    /// Run `body` as a durable transaction, retrying on OCC abort up to
+    /// `max_attempts` times. On a committed attempt the write set and a
+    /// commit-boundary record are flushed to `storage` before returning,
+    /// so the result is durable. Returns `Ok(Some(value))` on a durable
+    /// commit, `Ok(None)` if every attempt aborted or the body errored,
+    /// or `Err` on a storage failure.
+    pub fn transaction_durable<S, F, R>(
+        &self,
+        storage: &mut S,
+        max_attempts: u32,
+        mut body: F,
+    ) -> Result<Option<R>, S::Error>
+    where
+        S: BlockStorage,
+        F: FnMut(&mut Txn<'_, I>) -> Result<R, EngineError>,
+    {
+        for _ in 0..max_attempts {
+            let mut txn = self.begin();
+            let value = match body(&mut txn) {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            match txn.commit_durable(storage)? {
+                Some(_tid) => return Ok(Some(value)),
+                None => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Rebuild the record pool, index, and WAL cursor from the durable
+    /// log. Every fully-committed transaction group is replayed in commit
+    /// order (each group's records are contiguous, so log order is commit
+    /// order); a torn tail — writes whose commit record never landed — is
+    /// discarded, making recovery atomic per transaction. The global and
+    /// durable epochs are advanced past the highest recovered epoch.
+    ///
+    /// Run on a fresh engine, on a single CPU, before any transaction.
+    pub fn recover<S: BlockStorage>(&self, storage: &mut S) -> Result<(), S::Error> {
+        let scanned = Wal::recover(storage)?;
+        let end = scanned.next_lba();
+
+        // Writes of the commit group currently being accumulated. A group
+        // is at most one full write set.
+        let mut pending: [(Key, u64, bool); MAX_RW_SET] = [([0; 8], 0, false); MAX_RW_SET];
+        let mut pending_len = 0usize;
+        let mut max_epoch = 0u32;
+        // Cursor just past the last *accepted* commit boundary. Orphan
+        // records after it (a torn group's writes whose commit never
+        // landed) are not durable, so the next append overwrites them.
+        let mut durable_lba = WAL_START;
+        let mut durable_lsn = 1u64;
+
+        let mut lba = WAL_START;
+        while lba < end {
+            let rec = Wal::read_at(storage, lba)?
+                .expect("record within the recovered prefix must decode");
+            match rec.op() {
+                Some(Op::Put) => {
+                    if pending_len < MAX_RW_SET {
+                        pending[pending_len] = (rec.key, u64::from_be_bytes(rec.value), false);
+                        pending_len += 1;
+                    }
+                }
+                Some(Op::Delete) => {
+                    if pending_len < MAX_RW_SET {
+                        pending[pending_len] = (rec.key, 0, true);
+                        pending_len += 1;
+                    }
+                }
+                Some(Op::Commit) => {
+                    let count = u64::from_be_bytes(rec.value) as usize;
+                    let tid = Tid::from_raw(rec.epoch);
+                    // A count mismatch means writes were lost between this
+                    // record and its group — skip the whole group.
+                    if count == pending_len {
+                        for &(key, value, absent) in &pending[..pending_len] {
+                            self.recover_apply(key, value, absent, tid);
+                        }
+                        max_epoch = max_epoch.max(tid.epoch());
+                        durable_lba = lba + 1;
+                        durable_lsn = rec.lsn + 1;
+                    }
+                    pending_len = 0;
+                }
+                None => break,
+            }
+            lba += 1;
+        }
+        // Any leftover pending writes have no trailing commit record —
+        // a torn tail — and are dropped. Resume appends right after the
+        // last durable commit so those orphan records are overwritten and
+        // cannot corrupt a later recovery's group boundaries.
+        let mut wal = Wal::new();
+        wal.restore((durable_lba, durable_lsn));
+        *self.wal.lock() = wal;
+
+        ensure_epoch_at_least(max_epoch.saturating_add(1));
+        mark_durable(max_epoch);
+        Ok(())
+    }
+
+    /// Install a recovered committed write into its record + index,
+    /// bypassing the OCC protocol. Later groups overwrite earlier ones
+    /// for the same key (last committed wins).
+    fn recover_apply(&self, key: Key, value: u64, absent: bool, tid: Tid) {
+        let Some(slot) = self.slot_for(key) else {
+            return; // recovered working set exceeds the pool; drop the tail
+        };
+        let record = self.record(slot);
+        let install_tid = if absent {
+            Tid::from_raw(tid.raw() | Tid::ABSENT)
+        } else {
+            tid
+        };
+        // Safety: recovery runs single-threaded before the store opens,
+        // so there is no concurrent reader or writer of this record.
+        unsafe { record.restore(install_tid, value) };
     }
 
     /// Slot for `key`, allocating a fresh record if the key is new.
@@ -268,12 +411,73 @@ impl<'e, I: Index> Txn<'e, I> {
 
     /// Run the Silo precommit protocol over the buffered read/write set
     /// and consume the transaction. A read-only transaction commits iff
-    /// its read set still validates.
+    /// its read set still validates. The result is in-memory only; use
+    /// [`Txn::commit_durable`] to make it survive a crash.
     pub fn commit(mut self) -> CommitOutcome {
         // Safety: every record address in the sets points into
         // `engine.records`, which outlives `self` (the `&'e` borrow) and
         // never moves or frees a slot.
         unsafe { silo::commit(&mut self.state) }
+    }
+
+    /// Commit and make the write set durable before returning.
+    ///
+    /// On OCC success the write set plus a commit-boundary record are
+    /// appended to the WAL and flushed once, so the group is durable
+    /// atomically. Returns `Ok(Some(tid))` on a durable commit,
+    /// `Ok(None)` on an OCC abort (retry), or `Err` on a storage failure.
+    ///
+    /// The WAL lock is held across the whole commit — Silo precommit,
+    /// append, and flush — so durable commits are serialized. That makes
+    /// log (LBA) order equal commit order, which recovery relies on, and
+    /// it means a transaction cannot become durable while a commit it may
+    /// have read from is not: the earlier commit holds this lock until
+    /// its own flush completes. (In the current API the exclusive
+    /// `&mut storage` borrow already serializes durable commits; holding
+    /// the lock across the install makes the ordering invariant explicit
+    /// and robust to a future shared-storage path.)
+    ///
+    /// Ordering note: Silo installs the new versions in memory before
+    /// this logs them, so a crash before the flush loses the in-memory
+    /// effect too and memory stays consistent with disk. A storage
+    /// *error* (not a crash) after the install leaves memory ahead of the
+    /// log; the caller should treat that as a fatal durability fault.
+    ///
+    /// Throughput note: one flush per commit and full serialization are a
+    /// correctness-first baseline; Silo's batched group commit (amortize
+    /// one flush across many transactions via per-worker log buffers and
+    /// an epoch fence) is a later optimization.
+    pub fn commit_durable<S: BlockStorage>(
+        mut self,
+        storage: &mut S,
+    ) -> Result<Option<Tid>, S::Error> {
+        let mut wal = self.engine.wal.lock();
+
+        let new_tid = match unsafe { silo::commit(&mut self.state) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            _ => return Ok(None),
+        };
+
+        let writes = self.state.write_entries();
+        for w in writes {
+            let op = if w.absent { Op::Delete } else { Op::Put };
+            wal.append_no_flush(storage, op, new_tid.raw(), w.key, w.new_value.to_be_bytes())?;
+        }
+        // Commit boundary: `value` carries the write count so recovery
+        // can confirm the whole group landed.
+        wal.append_no_flush(
+            storage,
+            Op::Commit,
+            new_tid.raw(),
+            [0; 8],
+            (writes.len() as u64).to_be_bytes(),
+        )?;
+        wal.flush(storage)?;
+
+        // This commit and every commit ordered before it are now durable,
+        // so publishing the epoch boundary here is sound.
+        mark_durable(new_tid.epoch());
+        Ok(Some(new_tid))
     }
 }
 
@@ -444,5 +648,194 @@ mod tests {
             .transaction(4, |t| Ok((t.get(k(1))?.unwrap(), t.get(k(2))?.unwrap())))
             .unwrap();
         assert_eq!(pair, (7, 7));
+    }
+
+    // ---- durability + crash recovery (MemStorage) --------------------
+
+    use crate::lba_alloc::BLOCK_SIZE;
+    use crate::mem_storage::MemStorage;
+
+    fn garbage_block() -> [u8; BLOCK_SIZE] {
+        let mut b = [0u8; BLOCK_SIZE];
+        b[0] = 0x55; // non-magic first byte → invalid record
+        b
+    }
+
+    #[test]
+    fn durable_commit_persists_and_recovers() {
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        let r = engine
+            .transaction_durable(&mut storage, 4, |t| {
+                t.put(k(1), 100)?;
+                t.put(k(2), 200)?;
+                t.put(k(3), 300)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(r, Some(()));
+
+        // Crash: a fresh engine rebuilds its state from the log.
+        let recovered = Box::new(Engine::new());
+        recovered.recover(&mut storage).unwrap();
+        assert_eq!(recovered.transaction(4, |t| t.get(k(1))).unwrap(), Some(100));
+        assert_eq!(recovered.transaction(4, |t| t.get(k(2))).unwrap(), Some(200));
+        assert_eq!(recovered.transaction(4, |t| t.get(k(3))).unwrap(), Some(300));
+    }
+
+    #[test]
+    fn torn_commit_boundary_discards_the_whole_group() {
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        engine
+            .transaction_durable(&mut storage, 4, |t| {
+                t.put(k(1), 100)?;
+                t.put(k(2), 200)?;
+                t.put(k(3), 300)?;
+                Ok(())
+            })
+            .unwrap();
+
+        // The group is [put, put, put, commit] at WAL_START..WAL_START+4.
+        // Losing the commit boundary must drop all three writes.
+        storage.force_write(WAL_START + 3, garbage_block());
+
+        let recovered = Box::new(Engine::new());
+        recovered.recover(&mut storage).unwrap();
+        assert_eq!(recovered.transaction(4, |t| t.get(k(1))).unwrap(), None);
+        assert_eq!(recovered.transaction(4, |t| t.get(k(2))).unwrap(), None);
+        assert_eq!(recovered.transaction(4, |t| t.get(k(3))).unwrap(), None);
+    }
+
+    #[test]
+    fn torn_write_in_group_discards_the_whole_group() {
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        engine
+            .transaction_durable(&mut storage, 4, |t| {
+                t.put(k(1), 100)?;
+                t.put(k(2), 200)?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Tear the second write: recovery stops at the gap, so it never
+        // reaches the commit record and the first write is dropped too.
+        storage.force_write(WAL_START + 1, garbage_block());
+
+        let recovered = Box::new(Engine::new());
+        recovered.recover(&mut storage).unwrap();
+        assert_eq!(recovered.transaction(4, |t| t.get(k(1))).unwrap(), None);
+        assert_eq!(recovered.transaction(4, |t| t.get(k(2))).unwrap(), None);
+    }
+
+    #[test]
+    fn earlier_committed_group_survives_a_torn_later_group() {
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        // First durable commit: 1 write + boundary at WAL_START..+2.
+        engine
+            .transaction_durable(&mut storage, 4, |t| t.put(k(1), 11))
+            .unwrap();
+        // Second durable commit: 1 write + boundary at WAL_START+2..+4.
+        engine
+            .transaction_durable(&mut storage, 4, |t| t.put(k(2), 22))
+            .unwrap();
+
+        // Tear the second group's commit boundary (at WAL_START+3).
+        storage.force_write(WAL_START + 3, garbage_block());
+
+        let recovered = Box::new(Engine::new());
+        recovered.recover(&mut storage).unwrap();
+        assert_eq!(recovered.transaction(4, |t| t.get(k(1))).unwrap(), Some(11));
+        assert_eq!(recovered.transaction(4, |t| t.get(k(2))).unwrap(), None);
+    }
+
+    #[test]
+    fn durable_commit_after_recovering_a_torn_tail_survives_next_recovery() {
+        // Regression: recovery must resume the WAL cursor after the last
+        // durable commit, not after orphaned torn-tail writes — otherwise
+        // a commit made after recovery is mis-grouped and lost on the next
+        // recovery.
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        // A: 2 writes + commit at WAL_START..+3 (durable).
+        engine
+            .transaction_durable(&mut storage, 4, |t| {
+                t.put(k(1), 1)?;
+                t.put(k(2), 2)?;
+                Ok(())
+            })
+            .unwrap();
+        // B: 2 writes + commit at WAL_START+3..+6; tear B's commit (at +5).
+        engine
+            .transaction_durable(&mut storage, 4, |t| {
+                t.put(k(3), 3)?;
+                t.put(k(4), 4)?;
+                Ok(())
+            })
+            .unwrap();
+        storage.force_write(WAL_START + 5, garbage_block());
+
+        // Recovery keeps A, discards torn B, and rewinds the cursor to +3.
+        let r1 = Box::new(Engine::new());
+        r1.recover(&mut storage).unwrap();
+        assert_eq!(r1.transaction(4, |t| t.get(k(1))).unwrap(), Some(1));
+        assert_eq!(r1.transaction(4, |t| t.get(k(3))).unwrap(), None);
+
+        // C commits durably; it must overwrite B's orphan records.
+        r1.transaction_durable(&mut storage, 4, |t| t.put(k(5), 5)).unwrap();
+
+        // Second recovery: A and C survive, B stays gone.
+        let r2 = Box::new(Engine::new());
+        r2.recover(&mut storage).unwrap();
+        assert_eq!(r2.transaction(4, |t| t.get(k(1))).unwrap(), Some(1));
+        assert_eq!(r2.transaction(4, |t| t.get(k(5))).unwrap(), Some(5));
+        assert_eq!(r2.transaction(4, |t| t.get(k(3))).unwrap(), None);
+    }
+
+    #[test]
+    fn durable_delete_recovers_as_absent() {
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        engine
+            .transaction_durable(&mut storage, 4, |t| t.put(k(1), 5))
+            .unwrap();
+        engine
+            .transaction_durable(&mut storage, 4, |t| t.delete(k(1)))
+            .unwrap();
+
+        let recovered = Box::new(Engine::new());
+        recovered.recover(&mut storage).unwrap();
+        assert_eq!(recovered.transaction(4, |t| t.get(k(1))).unwrap(), None);
+    }
+
+    #[test]
+    fn commit_after_recovery_outranks_recovered_versions() {
+        let mut storage = MemStorage::new();
+        let engine = Box::new(Engine::new());
+        engine
+            .transaction_durable(&mut storage, 4, |t| t.put(k(1), 1))
+            .unwrap();
+
+        let recovered = Box::new(Engine::new());
+        recovered.recover(&mut storage).unwrap();
+
+        // Overwriting a recovered key requires the epoch to have advanced
+        // past the recovered version, or the new TID would not outrank it.
+        let r = recovered
+            .transaction_durable(&mut storage, 4, |t| {
+                assert_eq!(t.get(k(1))?, Some(1));
+                t.put(k(1), 2)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(r, Some(()));
+        assert_eq!(recovered.transaction(4, |t| t.get(k(1))).unwrap(), Some(2));
+
+        // And it survives a second crash.
+        let again = Box::new(Engine::new());
+        again.recover(&mut storage).unwrap();
+        assert_eq!(again.transaction(4, |t| t.get(k(1))).unwrap(), Some(2));
     }
 }

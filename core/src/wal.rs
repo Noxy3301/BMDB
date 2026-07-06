@@ -95,6 +95,11 @@ pub type Value = [u8; 8];
 pub enum Op {
     Put = 1,
     Delete = 2,
+    /// Commit boundary for a multi-write transaction. Follows the
+    /// transaction's `Put`/`Delete` records; its `value` field carries
+    /// the number of writes in the group so recovery can confirm the
+    /// whole set landed before applying any of it.
+    Commit = 3,
 }
 
 impl Op {
@@ -102,6 +107,7 @@ impl Op {
         match v {
             1 => Some(Op::Put),
             2 => Some(Op::Delete),
+            3 => Some(Op::Commit),
             _ => None,
         }
     }
