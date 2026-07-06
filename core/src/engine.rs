@@ -34,10 +34,10 @@
 //! of distinct keys; slot reclamation (EBR) and pool growth are later
 //! increments.
 //!
-//! Scope of this first cut: point `get`/`put` with read-your-writes,
-//! absent-read validation, and a bounded retry loop. Not yet here:
-//! durable commit (writes are in-memory only), delete/tombstones, range
-//! scans with phantom protection, and the concurrent index.
+//! Scope so far: point `get`/`put`/`delete` (tombstones) with
+//! read-your-writes, absent-read validation, and a bounded retry loop.
+//! Not yet here: durable commit (writes are in-memory only), range scans
+//! with phantom protection, and the concurrent index.
 //!
 //! [absent]: Tid::is_absent
 
@@ -219,7 +219,8 @@ impl<'e, I: Index> Txn<'e, I> {
     pub fn get(&mut self, key: Key) -> Result<Option<u64>, EngineError> {
         for w in self.state.write_entries() {
             if w.key == key {
-                return Ok(Some(w.new_value));
+                // A tombstone this transaction buffered reads back as gone.
+                return Ok(if w.absent { None } else { Some(w.new_value) });
             }
         }
         // Allocate a stable slot even for an absent key so this read can
@@ -249,6 +250,19 @@ impl<'e, I: Index> Txn<'e, I> {
         let record = self.engine.record(slot);
         self.state
             .add_write(record, key, value)
+            .map_err(|_| EngineError::TxnTooLarge)
+    }
+
+    /// Buffer a delete of `key`, recorded as a tombstone write. On commit
+    /// the key's record is published absent, so a later `get` returns
+    /// `None` and any concurrent reader of the pre-delete value aborts.
+    /// Deleting an absent key is a no-op that still advances the record's
+    /// version.
+    pub fn delete(&mut self, key: Key) -> Result<(), EngineError> {
+        let slot = self.engine.slot_for(key).ok_or(EngineError::OutOfSpace)?;
+        let record = self.engine.record(slot);
+        self.state
+            .add_delete(record, key)
             .map_err(|_| EngineError::TxnTooLarge)
     }
 
@@ -352,6 +366,50 @@ mod tests {
         engine.transaction(4, |t| t.put(k(1), 20)).unwrap();
         let v = engine.transaction(4, |t| t.get(k(1))).unwrap();
         assert_eq!(v, Some(20), "overwrite is visible after commit");
+    }
+
+    #[test]
+    fn delete_removes_a_committed_key() {
+        let engine = Box::new(Engine::new());
+        engine.transaction(4, |t| t.put(k(3), 30)).unwrap();
+        assert_eq!(engine.transaction(4, |t| t.get(k(3))).unwrap(), Some(30));
+
+        assert!(engine.transaction(4, |t| t.delete(k(3))).is_some());
+        assert_eq!(engine.transaction(4, |t| t.get(k(3))).unwrap(), None);
+    }
+
+    #[test]
+    fn read_your_deletes_and_put_delete_coalesce() {
+        let engine = Box::new(Engine::new());
+        engine.transaction(4, |t| t.put(k(1), 1)).unwrap();
+
+        // Within one transaction: delete is visible to a later get, and a
+        // put-then-delete on the same key lands as a single tombstone.
+        let ok = engine.transaction(4, |t| {
+            t.delete(k(1))?;
+            assert_eq!(t.get(k(1))?, None, "read-your-deletes");
+            t.put(k(2), 2)?;
+            t.delete(k(2))?;
+            assert_eq!(t.get(k(2))?, None, "put then delete reads as gone");
+            Ok(())
+        });
+        assert!(ok.is_some());
+        assert_eq!(engine.transaction(4, |t| t.get(k(1))).unwrap(), None);
+        assert_eq!(engine.transaction(4, |t| t.get(k(2))).unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_delete_aborts_a_readers_commit() {
+        let engine = Box::new(Engine::new());
+        engine.transaction(4, |t| t.put(k(5), 9)).unwrap();
+
+        let mut reader = engine.begin();
+        assert_eq!(reader.get(k(5)).unwrap(), Some(9));
+
+        // A concurrent transaction deletes key 5.
+        assert!(engine.transaction(4, |t| t.delete(k(5))).is_some());
+
+        assert_eq!(reader.commit(), CommitOutcome::AbortedReadChanged);
     }
 
     #[test]

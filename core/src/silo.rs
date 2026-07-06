@@ -269,11 +269,15 @@ pub struct ReadEntry {
 /// value to install on commit, and the key that identifies the record
 /// in the log. The lock/install sequence in the commit protocol walks
 /// this list; `key` is only consumed later by the commit-log path.
+///
+/// `absent` marks a tombstone: commit installs the record with the
+/// ABSENT bit set (a delete) instead of publishing `new_value`.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteEntry {
     pub record_addr: usize,
     pub key: Key,
     pub new_value: u64,
+    pub absent: bool,
 }
 
 impl ReadEntry {
@@ -288,6 +292,7 @@ impl WriteEntry {
         record_addr: 0,
         key: [0; 8],
         new_value: 0,
+        absent: false,
     };
 }
 
@@ -370,11 +375,32 @@ impl TxnState {
         key: Key,
         new_value: u64,
     ) -> Result<(), TxnError> {
+        self.buffer_write(record, key, new_value, false)
+    }
+
+    /// Buffer a delete as a tombstone write. Commit installs the record
+    /// with the ABSENT bit set under the new version, so a later read
+    /// sees the key gone and any reader of the pre-delete version aborts.
+    /// Coalesces with an earlier write to the same record like
+    /// [`add_write`], so a write-then-delete in one transaction lands as
+    /// a single tombstone.
+    pub fn add_delete(&mut self, record: &Record, key: Key) -> Result<(), TxnError> {
+        self.buffer_write(record, key, 0, true)
+    }
+
+    fn buffer_write(
+        &mut self,
+        record: &Record,
+        key: Key,
+        new_value: u64,
+        absent: bool,
+    ) -> Result<(), TxnError> {
         let addr = record as *const Record as usize;
         for slot in &mut self.write_set[..self.write_count as usize] {
             if slot.record_addr == addr {
                 slot.key = key;
                 slot.new_value = new_value;
+                slot.absent = absent;
                 return Ok(());
             }
         }
@@ -386,6 +412,7 @@ impl TxnState {
             record_addr: addr,
             key,
             new_value,
+            absent,
         };
         self.write_count += 1;
         Ok(())
@@ -531,10 +558,16 @@ pub unsafe fn commit(state: &mut TxnState) -> CommitOutcome {
     let new_tid = Tid::new(epoch, max_seq + 1);
 
     // 6. Install. Each `install` publishes the new value and releases
-    // the lock atomically via the TID Release store.
+    // the lock atomically via the TID Release store. A tombstone entry
+    // installs the same version with the ABSENT bit set instead of a
+    // value, so readers see the key as deleted.
     for entry in write_slice.iter() {
         let record = unsafe { &*(entry.record_addr as *const Record) };
-        unsafe { record.install(new_tid, entry.new_value) };
+        if entry.absent {
+            unsafe { record.install(Tid::from_raw(new_tid.raw() | Tid::ABSENT), 0) };
+        } else {
+            unsafe { record.install(new_tid, entry.new_value) };
+        }
     }
 
     // Publish the new commit TID so the next transaction on this
@@ -559,6 +592,9 @@ pub struct LogEntry {
     pub tid: Tid,
     pub key: Key,
     pub value: u64,
+    /// A tombstone: the commit deleted `key`. Persisted as `Op::Delete`
+    /// so recovery removes the key instead of writing `value`.
+    pub absent: bool,
 }
 
 impl LogEntry {
@@ -566,6 +602,7 @@ impl LogEntry {
         tid: Tid::from_raw(0),
         key: [0; 8],
         value: 0,
+        absent: false,
     };
 }
 
@@ -667,6 +704,7 @@ impl LogBuffer {
                 tid: commit_tid,
                 key: w.key,
                 value: w.new_value,
+                absent: w.absent,
             })
             .expect("pre-checked capacity must hold");
         }
@@ -740,9 +778,10 @@ pub fn persist<S: BlockStorage>(
             // recovery has a total order across all loggers. Tid bits
             // are `[epoch:32 | sequence:29 | status:3]`, so an ascending
             // sort by the u64 is exactly the Silo serialization order.
+            let op = if entry.absent { Op::Delete } else { Op::Put };
             if let Err(e) = wal.append_no_flush(
                 storage,
-                Op::Put,
+                op,
                 entry.tid.raw(),
                 entry.key,
                 entry.value.to_be_bytes(),
@@ -806,6 +845,7 @@ pub fn recover_in_commit_order<S: BlockStorage>(
             tid: Tid::from_raw(rec.epoch),
             key: rec.key,
             value: u64::from_be_bytes(rec.value),
+            absent: matches!(rec.op(), Some(Op::Delete)),
         });
         lba += 1;
     }
@@ -1187,9 +1227,9 @@ mod tests {
         let mut buf = LogBuffer::new();
         assert!(buf.is_empty());
 
-        buf.push(LogEntry { tid: Tid::new(3, 1), key: *b"k0______", value: 10 })
+        buf.push(LogEntry { tid: Tid::new(3, 1), key: *b"k0______", value: 10, absent: false })
             .unwrap();
-        buf.push(LogEntry { tid: Tid::new(3, 2), key: *b"k1______", value: 20 })
+        buf.push(LogEntry { tid: Tid::new(3, 2), key: *b"k1______", value: 20, absent: false })
             .unwrap();
         assert_eq!(buf.len(), 2);
 
@@ -1210,12 +1250,13 @@ mod tests {
                 tid: Tid::new(1, i as u32),
                 key: i.to_be_bytes(),
                 value: i,
+                absent: false,
             })
             .unwrap();
         }
         assert!(buf.is_full());
         assert_eq!(
-            buf.push(LogEntry { tid: Tid::new(1, 0), key: [0; 8], value: 0 }),
+            buf.push(LogEntry { tid: Tid::new(1, 0), key: [0; 8], value: 0, absent: false }),
             Err(LogOverflow),
         );
     }
@@ -1231,6 +1272,7 @@ mod tests {
                 tid: Tid::new(1, i as u32),
                 key: i.to_be_bytes(),
                 value: i,
+                absent: false,
             })
             .unwrap();
         }
@@ -1241,8 +1283,8 @@ mod tests {
         let r0 = Record::new(Tid::new(1, 0), 0);
         let r1 = Record::new(Tid::new(1, 0), 0);
         let writes = [
-            WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1 },
-            WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2 },
+            WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1, absent: false },
+            WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2, absent: false },
         ];
         assert_eq!(buf.record_commit(Tid::new(5, 1), &writes), Err(LogOverflow));
         assert_eq!(buf.len(), len_before, "partial write must not land");
@@ -1257,8 +1299,8 @@ mod tests {
         let r0 = Record::new(Tid::new(1, 0), 0);
         let r1 = Record::new(Tid::new(1, 0), 0);
         let writes = [
-            WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1 },
-            WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2 },
+            WriteEntry { record_addr: &r0 as *const _ as usize, key: *b"a_______", new_value: 1, absent: false },
+            WriteEntry { record_addr: &r1 as *const _ as usize, key: *b"b_______", new_value: 2, absent: false },
         ];
         let commit_tid = Tid::new(17, 42);
         buf.record_commit(commit_tid, &writes).unwrap();
@@ -1296,6 +1338,7 @@ mod tests {
                 tid: Tid::new(5, i as u32),
                 key: i.to_be_bytes(),
                 value: i,
+                absent: false,
             })
             .unwrap();
         }
@@ -1316,11 +1359,11 @@ mod tests {
 
         let mut buf_low = LogBuffer::new();
         buf_low
-            .push(LogEntry { tid: Tid::new(100, 1), key: [0; 8], value: 0 })
+            .push(LogEntry { tid: Tid::new(100, 1), key: [0; 8], value: 0, absent: false })
             .unwrap();
         let mut buf_high = LogBuffer::new();
         buf_high
-            .push(LogEntry { tid: Tid::new(200, 1), key: [1; 8], value: 1 })
+            .push(LogEntry { tid: Tid::new(200, 1), key: [1; 8], value: 1, absent: false })
             .unwrap();
 
         let before = durable_epoch();
@@ -1337,7 +1380,7 @@ mod tests {
         // must not drop the boundary.
         let mut buf_old = LogBuffer::new();
         buf_old
-            .push(LogEntry { tid: Tid::new(50, 1), key: [2; 8], value: 2 })
+            .push(LogEntry { tid: Tid::new(50, 1), key: [2; 8], value: 2, absent: false })
             .unwrap();
         let after2 = persist(&mut storage, &mut wal, &mut [&mut buf_old]).unwrap();
         assert_eq!(after2, after, "lower-epoch batch must not move boundary");
@@ -1353,13 +1396,13 @@ mod tests {
         let mut buf_b = LogBuffer::new();
 
         buf_a
-            .push(LogEntry { tid: Tid::new(7, 1), key: *b"alpha___", value: 1 })
+            .push(LogEntry { tid: Tid::new(7, 1), key: *b"alpha___", value: 1, absent: false })
             .unwrap();
         buf_a
-            .push(LogEntry { tid: Tid::new(7, 2), key: *b"bravo___", value: 2 })
+            .push(LogEntry { tid: Tid::new(7, 2), key: *b"bravo___", value: 2, absent: false })
             .unwrap();
         buf_b
-            .push(LogEntry { tid: Tid::new(8, 1), key: *b"charlie_", value: 3 })
+            .push(LogEntry { tid: Tid::new(8, 1), key: *b"charlie_", value: 3, absent: false })
             .unwrap();
 
         persist(&mut storage, &mut wal, &mut [&mut buf_a, &mut buf_b]).unwrap();
@@ -1519,6 +1562,63 @@ mod tests {
         assert_eq!(state.get(&key_a).copied(), Some(11));
         assert_eq!(state.get(&key_b).copied(), Some(222));
         assert_eq!(state.get(&key_c).copied(), Some(33));
+    }
+
+    #[test]
+    fn add_delete_buffers_a_tombstone_and_coalesces_with_prior_write() {
+        let r = Record::new(Tid::new(current_epoch(), 0), 0);
+        let mut t = TxnState::new(current_epoch());
+        t.add_write(&r, *b"k_______", 5).unwrap();
+        t.add_delete(&r, *b"k_______").unwrap();
+        assert_eq!(t.write_entries().len(), 1, "put+delete coalesce to one entry");
+        assert!(t.write_entries()[0].absent, "coalesced entry is a tombstone");
+
+        // A later write on the same record clears the tombstone.
+        t.add_write(&r, *b"k_______", 9).unwrap();
+        assert!(!t.write_entries()[0].absent, "delete then put is a present write");
+        assert_eq!(t.write_entries()[0].new_value, 9);
+    }
+
+    #[test]
+    fn commit_installs_a_tombstone_as_absent() {
+        let r = Record::new(Tid::new(current_epoch(), 0), 7);
+        let mut t = TxnState::new(current_epoch());
+        t.add_delete(&r, *b"k_______").unwrap();
+        assert!(matches!(unsafe { commit(&mut t) }, CommitOutcome::Committed { .. }));
+        // The record now reads absent, and cleanly (no lock bit stuck).
+        let (tid, _v) = r.read_snapshot().expect("tombstoned record snapshots cleanly");
+        assert!(tid.is_absent(), "deleted record reads absent");
+    }
+
+    #[test]
+    fn tombstone_persists_and_recovers_as_delete() {
+        // A committed transaction that writes one key and deletes another
+        // must persist the delete as Op::Delete so recovery removes the
+        // key rather than writing value 0.
+        use crate::mem_storage::MemStorage;
+
+        let mut storage = MemStorage::new();
+        let mut wal = Wal::new();
+        let mut buf = LogBuffer::new();
+
+        let r_a = Record::new(Tid::new(current_epoch(), 0), 0);
+        let r_b = Record::new(Tid::new(current_epoch(), 0), 0);
+        let mut txn = TxnState::new(current_epoch());
+        txn.add_write(&r_a, *b"keyA____", 11).unwrap();
+        txn.add_delete(&r_b, *b"keyB____").unwrap();
+        let tid = match unsafe { commit(&mut txn) } {
+            CommitOutcome::Committed { new_tid } => new_tid,
+            other => panic!("commit failed: {:?}", other),
+        };
+        buf.record_commit(tid, txn.write_entries()).unwrap();
+        persist(&mut storage, &mut wal, &mut [&mut buf]).unwrap();
+
+        let replay = recover_in_commit_order(&mut storage).unwrap();
+        assert_eq!(replay.len(), 2);
+        let a = replay.iter().find(|e| e.key == *b"keyA____").unwrap();
+        let b = replay.iter().find(|e| e.key == *b"keyB____").unwrap();
+        assert!(!a.absent && a.value == 11, "put recovered as a present value");
+        assert!(b.absent, "delete recovered as a tombstone");
     }
 
     #[test]

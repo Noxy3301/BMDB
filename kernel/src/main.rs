@@ -211,6 +211,24 @@ fn engine_gate() {
     assert_eq!(sum, 600, "engine read-back mismatch");
 
     serial_println!("ENGINE: 3-key txn committed, read-back OK (sum={})", sum);
+
+    // Delete one key in its own transaction, then confirm it is gone and
+    // the others survive.
+    let deleted = ENGINE.transaction(8, |txn| txn.delete(2u64.to_be_bytes()));
+    assert!(deleted.is_some(), "engine delete transaction must commit");
+
+    let after = ENGINE
+        .transaction(8, |txn| {
+            Ok((
+                txn.get(1u64.to_be_bytes())?,
+                txn.get(2u64.to_be_bytes())?,
+                txn.get(3u64.to_be_bytes())?,
+            ))
+        })
+        .expect("engine post-delete read must commit");
+    assert_eq!(after, (Some(100), None, Some(300)), "delete left wrong state");
+
+    serial_println!("ENGINE: delete OK (key 2 gone, keys 1 and 3 intact)");
 }
 
 fn init() {
