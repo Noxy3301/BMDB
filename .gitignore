@@ -9,3 +9,7 @@
 
 # QEMU disk images
 *.img
+
+# Python bytecode (tools/amt)
+__pycache__/
+*.pyc
