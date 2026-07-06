@@ -129,6 +129,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     silo_bench::run(&mut nvme, smp::online_aps());
     #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
     kv_gate_test(&mut nvme);
+    #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
+    engine_gate();
 
     serial_println!("It did not crash!");
     hlt_loop();
@@ -176,6 +178,39 @@ fn kv_gate_test(nvme: &mut bmdb_nvme::Controller) {
     assert_eq!(echo, new_value);
 
     serial_println!("KV: put+get OK (new lsn={}), total keys={}", new_lsn, new_lsn);
+}
+
+/// In-memory transaction-engine smoke test: commit a multi-key
+/// transaction, then read every key back in a second transaction. Proves
+/// the Silo OCC engine, the index, and the record pool work together on
+/// bare metal. Durability is not exercised here — the engine is
+/// in-memory until the WAL commit path lands.
+#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
+fn engine_gate() {
+    use bmdb_core::engine::Engine;
+
+    // 512 records × 64 bytes = 32 KiB; fine as a kernel static.
+    static ENGINE: Engine = Engine::new();
+
+    let wrote = ENGINE.transaction(8, |txn| {
+        txn.put(1u64.to_be_bytes(), 100)?;
+        txn.put(2u64.to_be_bytes(), 200)?;
+        txn.put(3u64.to_be_bytes(), 300)?;
+        Ok(())
+    });
+    assert!(wrote.is_some(), "engine 3-key transaction must commit");
+
+    let sum = ENGINE
+        .transaction(8, |txn| {
+            let a = txn.get(1u64.to_be_bytes())?.unwrap_or(0);
+            let b = txn.get(2u64.to_be_bytes())?.unwrap_or(0);
+            let c = txn.get(3u64.to_be_bytes())?.unwrap_or(0);
+            Ok(a + b + c)
+        })
+        .expect("engine read-back transaction must commit");
+    assert_eq!(sum, 600, "engine read-back mismatch");
+
+    serial_println!("ENGINE: 3-key txn committed, read-back OK (sum={})", sum);
 }
 
 fn init() {

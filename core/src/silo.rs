@@ -178,6 +178,19 @@ impl Record {
         Some((pre, value))
     }
 
+    /// Load the TID and value with plain atomic loads, skipping the
+    /// read-snapshot consistency re-check. The returned pair may be
+    /// internally inconsistent (a writer could be mid-install between
+    /// its value store and its TID store), so it is only for seeding a
+    /// transaction read that commit-time validation will re-check — never
+    /// for a value the caller trusts before its transaction commits. Both
+    /// loads are atomic, so there is no data race even under contention.
+    pub fn load_forced(&self) -> (Tid, u64) {
+        let tid = Tid::from_raw(self.tid.load(Ordering::Acquire));
+        let value = self.value.load(Ordering::Acquire);
+        (tid, value)
+    }
+
     /// Try to acquire the lock bit via CAS. Returns the observed
     /// pre-lock TID on success — the caller will later either install
     /// a new version (bumping TID) or unlock to restore the old one.
