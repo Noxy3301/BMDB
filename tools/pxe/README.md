@@ -62,7 +62,7 @@ which is why a raw `amtterm` just hangs at CONNECT), then run a test:
 
 ```bash
 tools/amt/bmdb-amt.py sol-enable          # one WS-Man Put; persists
-cargo run -p hw-runner -- hw-test                     # kv_gate_test
+cargo run -p hw-runner -- hw-test                     # engine durability gate
 cargo run -p hw-runner -- hw-test --features silo-bench --timeout 600
 ```
 

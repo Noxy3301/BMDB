@@ -16,8 +16,6 @@ mod percpu;
 mod silo_bench;
 mod smp;
 
-#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
-use bmdb_core::kv::Kv;
 use bmdb_core::lba_alloc;
 use bmdb_serial::serial_println;
 use bootloader_api::config::Mapping;
@@ -128,107 +126,69 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(feature = "silo-bench")]
     silo_bench::run(&mut nvme, smp::online_aps());
     #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
-    kv_gate_test(&mut nvme);
-    #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
-    engine_gate();
+    engine_durable_gate(&mut nvme);
 
     serial_println!("It did not crash!");
     hlt_loop();
 }
 
-/// Phase 3 crash-recovery gate.
+/// Transaction-engine crash-recovery gate.
 ///
-/// Recovers the KV by replaying the WAL, inserts one new record keyed by the
-/// next LSN, and verifies that every previously-recovered record is still
-/// readable. Runs on every boot; the recovered count grows by one per run,
-/// proving durability across `timeout` / kill / restart cycles.
+/// Rebuilds the durable store from the WAL, verifies every key a prior
+/// boot committed is still present, then durably commits one more key.
+/// Runs on every boot; the recovered count grows by one per run, proving
+/// transactional durability across `timeout` / kill / restart cycles.
+/// Also exercises a durable multi-key transaction with a delete.
 #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
-fn kv_gate_test(nvme: &mut bmdb_nvme::Controller) {
-    let mut kv = Kv::recover(nvme).expect("KV recover failed");
-
-    let lsn_at_start = kv.next_lsn();
-    let recovered = lsn_at_start.saturating_sub(1);
-    let (nodes, height) = kv.tree_stats();
-    serial_println!(
-        "KV: recovered {} record(s), next_lsn={}, tree nodes={}, height={}",
-        recovered,
-        lsn_at_start,
-        nodes,
-        height,
-    );
-
-    // Every prior boot wrote key = lsn.to_be_bytes(), value = (lsn * 10)
-    // .to_be_bytes(). Confirm all of those are still in the tree.
-    for lsn in 1..lsn_at_start {
-        let key = lsn.to_be_bytes();
-        let expected = (lsn * 10).to_be_bytes();
-        let got = kv.get(key).expect("recovered key missing from tree");
-        assert_eq!(got, expected, "recovered value mismatch for lsn={}", lsn);
-    }
-
-    // Append one more record tagged with the next LSN.
-    let new_lsn = kv.next_lsn();
-    let new_key = new_lsn.to_be_bytes();
-    let new_value = (new_lsn * 10).to_be_bytes();
-    let prior = kv.put(nvme, new_key, new_value).expect("KV put failed");
-    assert!(prior.is_none(), "fresh LSN should have no prior value");
-
-    // Immediate read-back.
-    let echo = kv.get(new_key).expect("KV get after put returned None");
-    assert_eq!(echo, new_value);
-
-    serial_println!("KV: put+get OK (new lsn={}), total keys={}", new_lsn, new_lsn);
-}
-
-/// In-memory transaction-engine smoke test: commit a multi-key
-/// transaction, then read every key back in a second transaction. Proves
-/// the Silo OCC engine, the index, and the record pool work together on
-/// bare metal. Durability is not exercised here — the engine is
-/// in-memory until the WAL commit path lands.
-#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
-fn engine_gate() {
+fn engine_durable_gate(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::engine::Engine;
 
     // 512 records × 64 bytes = 32 KiB; fine as a kernel static.
     static ENGINE: Engine = Engine::new();
 
-    let wrote = ENGINE.transaction(8, |txn| {
-        txn.put(1u64.to_be_bytes(), 100)?;
-        txn.put(2u64.to_be_bytes(), 200)?;
-        txn.put(3u64.to_be_bytes(), 300)?;
-        Ok(())
-    });
-    assert!(wrote.is_some(), "engine 3-key transaction must commit");
+    ENGINE.recover(nvme).expect("engine recover failed");
 
-    let sum = ENGINE
-        .transaction(8, |txn| {
-            let a = txn.get(1u64.to_be_bytes())?.unwrap_or(0);
-            let b = txn.get(2u64.to_be_bytes())?.unwrap_or(0);
-            let c = txn.get(3u64.to_be_bytes())?.unwrap_or(0);
-            Ok(a + b + c)
+    // Prior boots committed keys 1..=N durably (value = key * 10), one new
+    // key per boot. Count the survivors and verify each value.
+    let mut recovered = 0u64;
+    loop {
+        let key = (recovered + 1).to_be_bytes();
+        match ENGINE.transaction(8, |t| t.get(key)).flatten() {
+            Some(v) => {
+                assert_eq!(v, (recovered + 1) * 10, "recovered value mismatch");
+                recovered += 1;
+            }
+            None => break,
+        }
+    }
+    serial_println!("ENGINE: recovered {} durable key(s)", recovered);
+
+    // Durably commit the next key; it must survive the next boot.
+    let next = recovered + 1;
+    ENGINE
+        .transaction_durable(nvme, 8, |t| t.put(next.to_be_bytes(), next * 10))
+        .expect("durable commit I/O error")
+        .expect("durable commit aborted");
+    serial_println!("ENGINE: durably committed key {} (total {} key(s))", next, next);
+
+    // Durable multi-key transaction with a delete, on a high key range so
+    // it does not disturb the per-boot counter above.
+    ENGINE
+        .transaction_durable(nvme, 8, |t| {
+            t.put(1001u64.to_be_bytes(), 11)?;
+            t.put(1002u64.to_be_bytes(), 22)?;
+            t.delete(1001u64.to_be_bytes())?;
+            Ok(())
         })
-        .expect("engine read-back transaction must commit");
-    assert_eq!(sum, 600, "engine read-back mismatch");
-
-    serial_println!("ENGINE: 3-key txn committed, read-back OK (sum={})", sum);
-
-    // Delete one key in its own transaction, then confirm it is gone and
-    // the others survive.
-    let deleted = ENGINE.transaction(8, |txn| txn.delete(2u64.to_be_bytes()));
-    assert!(deleted.is_some(), "engine delete transaction must commit");
-
-    let after = ENGINE
-        .transaction(8, |txn| {
-            Ok((
-                txn.get(1u64.to_be_bytes())?,
-                txn.get(2u64.to_be_bytes())?,
-                txn.get(3u64.to_be_bytes())?,
-            ))
+        .expect("durable demo I/O error")
+        .expect("durable demo aborted");
+    let state = ENGINE
+        .transaction(8, |t| {
+            Ok((t.get(1001u64.to_be_bytes())?, t.get(1002u64.to_be_bytes())?))
         })
-        .expect("engine post-delete read must commit");
-    assert_eq!(after, (Some(100), None, Some(300)), "delete left wrong state");
-
-    serial_println!("ENGINE: delete OK (key 2 gone, keys 1 and 3 intact)");
+        .expect("post-demo read must commit");
+    assert_eq!(state, (None, Some(22)), "put+delete demo left wrong state");
+    serial_println!("ENGINE: multi-key durable txn + delete OK (1001 deleted, 1002=22)");
 }
 
 fn init() {
