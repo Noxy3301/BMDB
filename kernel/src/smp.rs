@@ -21,16 +21,20 @@
 //!     halts. The BSP polls that counter per AP with a bounded TSC
 //!     busy-wait, matching the `SMP-d.1` timing shape.
 //!
-//! Assumptions inherited from SMP-d.1 (documented scope-defer): phys
-//! `0x8000`, `0xB000`, `0xC000` are free. Proper reservation against
-//! `BootInfo::memory_map` plus a real frame allocator come in a later
-//! commit when per-AP stacks move to dynamic allocation.
+//! Low physical pages (the trampoline page and page-table scratch
+//! frames) are validated against the bootloader memory map before use —
+//! under UEFI the sub-1 MiB layout is firmware-owned, so "0x8000 is
+//! free" is a per-boot fact, not an axiom. A dynamic trampoline address
+//! is deliberately not supported: the trampoline assembly bakes its
+//! base in as absolute constants, so relocation would need position-
+//! independent 16-bit code for little gain.
 
 use core::arch::global_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use bmdb_serial::serial_println;
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use x86_64::registers::control::Cr3;
 
 use crate::acpi::{ACPI, CpuInfo, MAX_CPUS};
@@ -41,12 +45,36 @@ use crate::apic::LAPIC;
 /// AP trampoline page. SIPI vector `0x08` selects this.
 const AP_TRAMPOLINE_PHYS: u64 = 0x8000;
 
-/// Scratch frame used when the existing `PML4[0] → L3 → L2` tree has
-/// no `L3[0]` yet — the BSP must install an L2 before adding the
-/// identity mapping. The L3 and everything above come from bootloader
-/// 0.9's kernel mapping, so no L3 scratch is needed here. See module
-/// doc comment for the memory-map scope-defer note.
-const IDENTITY_L2_PHYS: u64 = 0xC000;
+/// Scratch frames for page-table levels the identity mapping has to
+/// create. The kernel now lives in the higher half (bootloader 0.11
+/// picks a dynamic base), so the lower-half tree can be entirely
+/// absent — worst case needs a fresh L3, L2, and L1.
+const SCRATCH_FRAMES: [u64; 3] = [0xB000, 0xC000, 0xD000];
+
+/// Hands out [`SCRATCH_FRAMES`] one at a time. All frames are validated
+/// as usable RAM before the first `take`.
+struct ScratchFrames {
+    next: usize,
+}
+
+impl ScratchFrames {
+    fn take(&mut self) -> Option<u64> {
+        let frame = SCRATCH_FRAMES.get(self.next).copied();
+        if frame.is_some() {
+            self.next += 1;
+        }
+        frame
+    }
+}
+
+/// True when the 4 KiB frame at `phys` lies inside usable RAM per the
+/// bootloader memory map. Anything else (reserved, bootloader-claimed,
+/// UEFI runtime, hole) must not be scribbled on.
+fn frame_is_usable(regions: &[MemoryRegion], phys: u64) -> bool {
+    regions.iter().any(|r| {
+        r.kind == MemoryRegionKind::Usable && r.start <= phys && phys + 4096 <= r.end
+    })
+}
 
 // -- AP stack pool -----------------------------------------------------
 
@@ -188,14 +216,14 @@ ap_32bit_phys:
     or eax, 1 << 5
     mov cr4, eax
 
-    # CR3 points at the kernel PML4. Bootloader 0.9 places it below
-    # 4 GiB so a 32-bit load covers it.
+    # CR3 points at the kernel PML4. Only 32 bits are loadable here;
+    # the BSP verifies the frame sits below 4 GiB before any SIPI.
     mov eax, [AP_HDR_CR3_ADDR]
     mov cr3, eax
 
     # EFER: set LME (bit 8) to enable long mode, and NXE (bit 11) so
     # page-table entries with the NX bit are not treated as reserved
-    # — bootloader 0.9 marks kernel data pages with NX, and without
+    # — the bootloader marks kernel data pages with NX, and without
     # NXE the AP would #PF on any such access even though the BSP
     # tolerates it with its own NXE=1.
     mov ecx, 0xC0000080
@@ -326,11 +354,11 @@ unsafe fn write_trampoline_header(
 // -- Identity mapping injection ---------------------------------------
 
 /// Install `virt 0x8000` → `phys 0x8000` into the kernel's active page
-/// tree, creating the minimum number of intermediate entries needed to
-/// reach the target. Every existing entry above the inserted 4 KiB PTE
-/// is preserved — bootloader 0.9 already uses PML4[0] through L1 to
-/// map the kernel image, so clobbering any level would unmap live
-/// kernel state and triple-fault.
+/// tree, creating any missing intermediate level from the scratch-frame
+/// pool. Every existing entry is preserved — bootloader 0.11 places the
+/// kernel in the higher half, so the lower-half tree is usually absent
+/// and built here from scratch, but a firmware or bootloader that did
+/// populate it must not have live state clobbered.
 ///
 /// Returns `true` when the mapping is definitely in place (either just
 /// installed or already present), `false` on any case we refuse to
@@ -339,11 +367,10 @@ unsafe fn write_trampoline_header(
 ///
 /// # Safety
 /// - `phys_mem_offset` must map all physical memory.
-/// - The frame at `IDENTITY_L2_PHYS` must not be used by anyone else
-///   (only claimed if the tree happens to need a new L1 at L2[0]).
-///   See module-level scope-defer note.
+/// - The [`SCRATCH_FRAMES`] must be usable RAM owned by this module
+///   (the caller validates them against the memory map).
 /// - Must be called on the BSP exactly once before any AP is woken.
-unsafe fn inject_identity_mapping(phys_mem_offset: u64) -> bool {
+unsafe fn inject_identity_mapping(phys_mem_offset: u64, scratch: &mut ScratchFrames) -> bool {
     const PRESENT: u64 = 1 << 0;
     const WRITABLE: u64 = 1 << 1;
     const HUGE: u64 = 1 << 7;
@@ -357,30 +384,42 @@ unsafe fn inject_identity_mapping(phys_mem_offset: u64) -> bool {
     let l2_idx = ((target_virt >> 21) & 0x1FF) as usize;
     let l1_idx = ((target_virt >> 12) & 0x1FF) as usize;
 
+    // Follow an existing entry, or install a zeroed scratch frame as
+    // the next-level table. Returns the next level's physical base.
+    let mut descend = |table_ptr: *mut u64, idx: usize, level: &str| -> Option<u64> {
+        let entry = unsafe { ptr::read_volatile(table_ptr.add(idx)) };
+        if entry & PRESENT != 0 {
+            return Some(entry & ADDR_MASK);
+        }
+        let frame = match scratch.take() {
+            Some(f) => f,
+            None => {
+                serial_println!("SMP: out of scratch frames building {}", level);
+                return None;
+            }
+        };
+        unsafe {
+            ptr::write_bytes((phys_mem_offset + frame) as *mut u8, 0, 4096);
+            ptr::write_volatile(table_ptr.add(idx), frame | PRESENT | WRITABLE);
+        }
+        Some(frame)
+    };
+
     let (cr3_frame, _) = Cr3::read();
     let pml4_phys = cr3_frame.start_address().as_u64();
     let pml4_ptr = (phys_mem_offset + pml4_phys) as *mut u64;
-    let pml4_entry = unsafe { ptr::read_volatile(pml4_ptr.add(pml4_idx)) };
 
-    if pml4_entry & PRESENT == 0 {
-        serial_println!(
-            "SMP: PML4[{}] absent — bootloader did not map the kernel through it?",
-            pml4_idx
-        );
-        return false;
-    }
+    // L3 (build if the lower half is unmapped, the common 0.11 case).
+    let l3_phys = match descend(pml4_ptr, pml4_idx, "L3") {
+        Some(p) => p,
+        None => return false,
+    };
 
-    // L3.
-    let l3_phys = pml4_entry & ADDR_MASK;
+    // L2 — unless L3 already holds a 1 GiB huge mapping.
     let l3_ptr = (phys_mem_offset + l3_phys) as *mut u64;
     let l3_entry = unsafe { ptr::read_volatile(l3_ptr.add(l3_idx)) };
-    if l3_entry & PRESENT == 0 {
-        serial_println!("SMP: L3[{}] absent — need a fresh L2, not implemented", l3_idx);
-        return false;
-    }
-    if l3_entry & HUGE != 0 {
-        // 1 GiB huge page. Identity only if its base aligns with the
-        // target's 1 GiB region.
+    if l3_entry & PRESENT != 0 && l3_entry & HUGE != 0 {
+        // Identity only if its base aligns with the target's 1 GiB region.
         let base = l3_entry & ADDR_MASK;
         if base == target_phys & !0x3FFF_FFFF {
             return true;
@@ -391,12 +430,14 @@ unsafe fn inject_identity_mapping(phys_mem_offset: u64) -> bool {
         );
         return false;
     }
+    let l2_phys = match descend(l3_ptr, l3_idx, "L2") {
+        Some(p) => p,
+        None => return false,
+    };
 
-    // L2.
-    let l2_phys = l3_entry & ADDR_MASK;
+    // L1 — unless L2 already holds a 2 MiB huge mapping.
     let l2_ptr = (phys_mem_offset + l2_phys) as *mut u64;
     let l2_entry = unsafe { ptr::read_volatile(l2_ptr.add(l2_idx)) };
-
     if l2_entry & PRESENT != 0 && l2_entry & HUGE != 0 {
         let base = l2_entry & ADDR_MASK;
         if base == target_phys & !0x1F_FFFF {
@@ -408,19 +449,9 @@ unsafe fn inject_identity_mapping(phys_mem_offset: u64) -> bool {
         );
         return false;
     }
-
-    // L1 — follow existing L2 pointer, or create a new L1 at our
-    // scratch frame if L2[l2_idx] is absent.
-    let l1_phys = if l2_entry & PRESENT != 0 {
-        l2_entry & ADDR_MASK
-    } else {
-        let l1_frame = IDENTITY_L2_PHYS;
-        let l1_virt = phys_mem_offset + l1_frame;
-        unsafe { ptr::write_bytes(l1_virt as *mut u8, 0, 4096) };
-        unsafe {
-            ptr::write_volatile(l2_ptr.add(l2_idx), l1_frame | PRESENT | WRITABLE);
-        }
-        l1_frame
+    let l1_phys = match descend(l2_ptr, l2_idx, "L1") {
+        Some(p) => p,
+        None => return false,
     };
 
     let l1_ptr = (phys_mem_offset + l1_phys) as *mut u64;
@@ -511,11 +542,39 @@ pub extern "C" fn ap_main(cpu_index: u64) -> ! {
 /// move to the next. Serial bring-up keeps the header race-free.
 ///
 /// # Safety
-/// Requires the bootloader's `map_physical_memory` mapping at
+/// Requires the bootloader's whole-physical-memory mapping at
 /// `phys_mem_offset`, the LAPIC and ACPI modules already initialized,
 /// and a single call on the BSP.
-pub unsafe fn init(phys_mem_offset: u64) {
-    if !unsafe { inject_identity_mapping(phys_mem_offset) } {
+pub unsafe fn init(phys_mem_offset: u64, regions: &[MemoryRegion]) {
+    // The trampoline page and every scratch frame must be RAM the
+    // firmware isn't using. Sub-1 MiB layout differs per machine and
+    // per firmware; a wrong guess here corrupts firmware state instead
+    // of failing cleanly.
+    for phys in core::iter::once(AP_TRAMPOLINE_PHYS).chain(SCRATCH_FRAMES) {
+        if !frame_is_usable(regions, phys) {
+            serial_println!(
+                "SMP: phys 0x{:x} not usable per memory map, aborting AP bring-up",
+                phys,
+            );
+            return;
+        }
+    }
+
+    // BSP's active PML4 — all APs share it. The trampoline loads CR3
+    // with a 32-bit move while still in protected mode, so a PML4 frame
+    // above 4 GiB is unreachable there.
+    let (cr3_frame, _) = Cr3::read();
+    let cr3_phys = cr3_frame.start_address().as_u64();
+    if cr3_phys >= 1 << 32 {
+        serial_println!(
+            "SMP: PML4 at 0x{:x} is above 4 GiB, trampoline cannot load it; aborting",
+            cr3_phys,
+        );
+        return;
+    }
+
+    let mut scratch = ScratchFrames { next: 0 };
+    if !unsafe { inject_identity_mapping(phys_mem_offset, &mut scratch) } {
         serial_println!("SMP: identity mapping failed, aborting AP bring-up");
         return;
     }
@@ -528,10 +587,6 @@ pub unsafe fn init(phys_mem_offset: u64) {
         AP_TRAMPOLINE_PHYS,
         tramp_len,
     );
-
-    // BSP's active PML4 — all APs share it.
-    let (cr3_frame, _) = Cr3::read();
-    let cr3_phys = cr3_frame.start_address().as_u64();
 
     // Snapshot ACPI CPU list to avoid holding the lock across per-AP
     // waits. Snapshot before reading BSP APIC ID so the lock order

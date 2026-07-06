@@ -19,6 +19,15 @@ pub struct PciAddress {
     pub function: u8,
 }
 
+/// A decoded Base Address Register. The low bits of the raw value select
+/// the address space; callers need to know which one they got, since an
+/// I/O BAR is reached with `in`/`out` and a memory BAR through the MMU.
+#[derive(Debug, Clone, Copy)]
+pub enum Bar {
+    Io { port: u16 },
+    Mmio { addr: u64 },
+}
+
 /// Read a 32-bit word from a device's config space.
 /// `offset` is byte offset, must be 4-byte aligned.
 fn read_config(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
@@ -54,8 +63,34 @@ fn write_config(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     }
 }
 
-/// Walk all devices on `bus` and print what we find.
-pub fn scan_bus(bus: u8) {
+/// Tracks buses already walked. Broken firmware can wire bridge
+/// secondary-bus numbers into a cycle; 256 bits of state is cheaper
+/// than trusting it not to.
+struct BusVisited([u64; 4]);
+
+impl BusVisited {
+    fn new() -> Self {
+        BusVisited([0; 4])
+    }
+
+    /// Returns `true` the first time `bus` is claimed.
+    fn claim(&mut self, bus: u8) -> bool {
+        let word = (bus >> 6) as usize;
+        let bit = 1u64 << (bus & 63);
+        let fresh = self.0[word] & bit == 0;
+        self.0[word] |= bit;
+        fresh
+    }
+}
+
+/// Walk one bus, invoking `f` for every function, and recurse into
+/// PCI-PCI bridges. Real machines put NVMe (and most everything else)
+/// behind root ports on secondary buses, so a flat bus-0 scan only
+/// works on QEMU's default machine.
+fn walk_bus(bus: u8, visited: &mut BusVisited, f: &mut impl FnMut(PciAddress, u8, u8, u8)) {
+    if !visited.claim(bus) {
+        return;
+    }
     for device in 0..32 {
         // An empty slot returns 0xFFFF as vendor ID (pull-ups on the bus).
         let vendor = (read_config(bus, device, 0, 0x00) & 0xFFFF) as u16;
@@ -68,72 +103,101 @@ pub fn scan_bus(bus: u8) {
         let max_function = if header_type & 0x80 != 0 { 8 } else { 1 };
 
         for function in 0..max_function {
-            let vendor_device = read_config(bus, device, function, 0x00);
-            let vendor = (vendor_device & 0xFFFF) as u16;
+            let vendor = (read_config(bus, device, function, 0x00) & 0xFFFF) as u16;
             if vendor == 0xFFFF {
                 continue;
             }
-            let device_id = (vendor_device >> 16) as u16;
             let class_rev = read_config(bus, device, function, 0x08);
             let class = (class_rev >> 24) as u8;
             let subclass = (class_rev >> 16) as u8;
             let prog_if = (class_rev >> 8) as u8;
-            serial_println!(
-                "{:02x}:{:02x}.{} vendor={:#06x} device={:#06x} class={:02x}:{:02x}:{:02x}",
-                bus, device, function, vendor, device_id, class, subclass, prog_if,
+
+            f(
+                PciAddress { bus, device, function },
+                class,
+                subclass,
+                prog_if,
             );
+
+            // Header type 0x01 = PCI-PCI bridge; its downstream bus
+            // number lives in config offset 0x19.
+            let fn_header = (read_config(bus, device, function, 0x0C) >> 16) as u8;
+            if fn_header & 0x7F == 0x01 {
+                let secondary = ((read_config(bus, device, function, 0x18) >> 8) & 0xFF) as u8;
+                if secondary != 0 {
+                    walk_bus(secondary, visited, f);
+                }
+            }
         }
     }
 }
 
-/// Find the first device on bus 0 matching the given class / subclass.
+/// Walk the whole hierarchy from bus 0 and print what we find.
+pub fn scan_all() {
+    let mut visited = BusVisited::new();
+    walk_bus(0, &mut visited, &mut |addr, class, subclass, prog_if| {
+        let vendor_device = read_config(addr.bus, addr.device, addr.function, 0x00);
+        serial_println!(
+            "{:02x}:{:02x}.{} vendor={:#06x} device={:#06x} class={:02x}:{:02x}:{:02x}",
+            addr.bus,
+            addr.device,
+            addr.function,
+            (vendor_device & 0xFFFF) as u16,
+            (vendor_device >> 16) as u16,
+            class,
+            subclass,
+            prog_if,
+        );
+    });
+}
+
+/// Find the first function anywhere in the hierarchy matching the given
+/// class / subclass.
 pub fn find_device(class: u8, subclass: u8) -> Option<PciAddress> {
-    for device in 0..32 {
-        let vendor = (read_config(0, device, 0, 0x00) & 0xFFFF) as u16;
-        if vendor == 0xFFFF {
-            continue;
+    let mut found = None;
+    let mut visited = BusVisited::new();
+    walk_bus(0, &mut visited, &mut |addr, c, s, _| {
+        if c == class && s == subclass && found.is_none() {
+            found = Some(addr);
         }
-
-        let header_type = (read_config(0, device, 0, 0x0C) >> 16) as u8;
-        let max_function = if header_type & 0x80 != 0 { 8 } else { 1 };
-
-        for function in 0..max_function {
-            let vendor = (read_config(0, device, function, 0x00) & 0xFFFF) as u16;
-            if vendor == 0xFFFF {
-                continue;
-            }
-            let class_rev = read_config(0, device, function, 0x08);
-            if (class_rev >> 24) as u8 == class && (class_rev >> 16) as u8 == subclass {
-                return Some(PciAddress { bus: 0, device, function });
-            }
-        }
-    }
-    None
+    });
+    found
 }
 
-/// Resolve a BAR to a physical address. Supports 32-bit and 64-bit memory BARs.
-pub fn read_bar(addr: &PciAddress, bar_index: u8) -> u64 {
+/// Decode a BAR. I/O BARs (bit 0 set) hold a port number; memory BARs
+/// hold a 32-bit or 64-bit physical address (bits [2:1] = 10 selects
+/// 64-bit, with the upper half in the next dword).
+pub fn read_bar(addr: &PciAddress, bar_index: u8) -> Bar {
     let offset = 0x10 + bar_index * 4;
     let lower = read_config(addr.bus, addr.device, addr.function, offset);
 
-    // BAR bits [2:1] = 10 means 64-bit memory BAR (upper half is at next dword).
+    if lower & 1 != 0 {
+        return Bar::Io {
+            port: (lower & 0xFFFF_FFFC) as u16,
+        };
+    }
+
     let is_64 = (lower & 0b110) == 0b100;
     let base_low = (lower & 0xFFFF_FFF0) as u64;
     if is_64 {
         let upper = read_config(addr.bus, addr.device, addr.function, offset + 4);
-        ((upper as u64) << 32) | base_low
+        Bar::Mmio {
+            addr: ((upper as u64) << 32) | base_low,
+        }
     } else {
-        base_low
+        Bar::Mmio { addr: base_low }
     }
 }
 
-/// Enable Memory Space (bit 1) and Bus Master (bit 2) in the command register.
-/// Memory Space lets the CPU reach the device's BARs; Bus Master lets the
-/// device initiate DMA back into system RAM.
+/// Enable I/O Space (bit 0), Memory Space (bit 1) and Bus Master (bit 2)
+/// in the command register. I/O and Memory let the CPU reach the
+/// device's BARs of either kind; Bus Master lets the device initiate DMA
+/// back into system RAM. Setting a space bit the device has no BARs for
+/// is a no-op.
 pub fn enable_device(addr: &PciAddress) {
     // Command and status share one dword; preserve status by masking.
     let dword = read_config(addr.bus, addr.device, addr.function, 0x04);
-    let command = (dword & 0xFFFF) | (1 << 1) | (1 << 2);
+    let command = (dword & 0xFFFF) | (1 << 0) | (1 << 1) | (1 << 2);
     write_config(
         addr.bus,
         addr.device,

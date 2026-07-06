@@ -1,59 +1,19 @@
-# Root config. Kept free of `[unstable]` so `cargo test --target
-# x86_64-unknown-linux-gnu` does not try to rebuild `core` from source and
-# collide with the precompiled `std` the host test harness pulls in.
-#
-# Bare-metal builds get their `build-std` and target settings either by
-# running from inside `kernel/` (where `kernel/.cargo/config.toml` applies)
-# or via the aliases below.
-
-[target.'cfg(target_os = "none")']
-# bootimage post-processes the kernel ELF into a bootable disk image and
-# launches QEMU. Keep here so the `cargo krun` alias picks it up when run
-# from the repo root.
-runner = "bootimage runner"
+# Root config. The kernel builds against the built-in
+# `x86_64-unknown-none` target (no build-std, no custom JSON); disk
+# images (BIOS + UEFI + PXE/TFTP) are produced host-side by
+# `tools/hw-runner` via the bootloader 0.11 builder API, which also
+# spawns QEMU. Host unit tests stay on the default host target.
 
 [alias]
-# Bare-metal build/run from the workspace root. Mirrors what
-# `kernel/.cargo/config.toml` does when run from inside `kernel/`.
-krun = [
-    "run",
-    "-Zbuild-std=core,compiler_builtins",
-    "-Zbuild-std-features=compiler-builtins-mem",
-    "-Zjson-target-spec",
-    "--target", "kernel/x86_64-bmdb.json",
-    "-p", "bmdb-kernel",
-]
-kbuild = [
-    "build",
-    "-Zbuild-std=core,compiler_builtins",
-    "-Zbuild-std-features=compiler-builtins-mem",
-    "-Zjson-target-spec",
-    "--target", "kernel/x86_64-bmdb.json",
-    "-p", "bmdb-kernel",
-]
+# Build the bare-metal kernel ELF.
+kbuild = ["build", "--target", "x86_64-unknown-none", "-p", "bmdb-kernel"]
 
-# Boot the bench build under QEMU. Same as `krun` plus `--features bench`
-# on the kernel crate.
-kbench = [
-    "run",
-    "-Zbuild-std=core,compiler_builtins",
-    "-Zbuild-std-features=compiler-builtins-mem",
-    "-Zjson-target-spec",
-    "--target", "kernel/x86_64-bmdb.json",
-    "-p", "bmdb-kernel",
-    "--features", "bench",
-]
+# Build + boot under QEMU (BIOS image by default; pass --uefi for OVMF).
+krun = ["run", "-p", "hw-runner", "--", "qemu"]
 
-# Concurrent Silo OCC workload + group-commit persist across every AP.
-ksilobench = [
-    "run",
-    "-Zbuild-std=core,compiler_builtins",
-    "-Zbuild-std-features=compiler-builtins-mem",
-    "-Zjson-target-spec",
-    "--target", "kernel/x86_64-bmdb.json",
-    "-p", "bmdb-kernel",
-    "--features", "silo-bench",
-]
+# Latency microbench / concurrent Silo OCC workload under QEMU.
+kbench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "bench"]
+ksilobench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "silo-bench"]
 
 # Host-side unit tests for the pure-logic `core` crate.
 ctest = ["test", "--target", "x86_64-unknown-linux-gnu", "-p", "bmdb-core"]

@@ -9,10 +9,12 @@
 //! to their field sizes, so every multi-byte field read uses
 //! `read_unaligned`.
 //!
-//! Discovery assumes legacy BIOS boot: the RSDP lives in the last 128
-//! KiB of the first megabyte (0xE_0000..0x10_0000). UEFI systems hand
-//! the RSDP pointer over through the bootloader; this kernel uses
-//! `bootloader` 0.9 which does not, so we fall back to the scan.
+//! Discovery prefers the bootloader-reported RSDP address (`bootloader`
+//! 0.11 forwards it on both UEFI and BIOS boots — on UEFI the RSDP
+//! lives in an EFI configuration table at an arbitrary high address).
+//! When the bootloader reports nothing, fall back to the legacy BIOS
+//! scan of the last 128 KiB of the first megabyte
+//! (0xE_0000..0x10_0000).
 
 use bmdb_core::sync::SpinLock;
 use bmdb_serial::serial_println;
@@ -62,52 +64,55 @@ impl AcpiInfo {
 /// callers that need ACPI must handle that explicitly.
 pub static ACPI: SpinLock<Option<AcpiInfo>> = SpinLock::new(None);
 
+/// Validate an RSDP candidate: signature plus checksums. For revision
+/// >= 2 RSDPs, both the 20-byte (ACPI 1.0) and the 36-byte (extended)
+/// checksums must hold — otherwise the XSDT pointer at offset 24 is not
+/// trustworthy (ACPI 6.4 §5.2.5.3). `max_len` bounds how many bytes are
+/// readable at `ptr`, so a truncated candidate near a region edge is
+/// rejected instead of read past.
+unsafe fn validate_rsdp(ptr: *const u8, max_len: usize) -> bool {
+    const SIG: &[u8; 8] = b"RSD PTR ";
+
+    if max_len < 20 {
+        return false;
+    }
+    let sig = unsafe { core::slice::from_raw_parts(ptr, 8) };
+    if sig != SIG {
+        return false;
+    }
+    let first20 = unsafe { core::slice::from_raw_parts(ptr, 20) };
+    let sum20: u8 = first20.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    if sum20 != 0 {
+        return false;
+    }
+    let revision = unsafe { *ptr.add(15) };
+    if revision >= 2 {
+        // The RSDP claims ACPI 2.0+; its extended tail must be readable
+        // and checksum clean, or the XSDT pointer would be garbage.
+        if max_len < 36 {
+            return false;
+        }
+        let full = unsafe { core::slice::from_raw_parts(ptr, 36) };
+        let sum36: u8 = full.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        if sum36 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Scan the BIOS ROM region for the RSDP signature. Returns the virtual
 /// pointer for a valid RSDP, or `None` if nothing passes the checksum.
-/// For revision >= 2 RSDPs, both the 20-byte (ACPI 1.0) and the 36-byte
-/// (extended) checksums must hold — otherwise the XSDT pointer at
-/// offset 24 is not trustworthy (ACPI 6.4 §5.2.5.3).
 unsafe fn find_rsdp(phys_mem_offset: u64) -> Option<*const u8> {
-    const SIG: &[u8; 8] = b"RSD PTR ";
     const START: u64 = 0xE_0000;
     const END: u64 = 0x10_0000;
     // ACPI spec: RSDP is aligned on a 16-byte boundary within this region.
     const STEP: u64 = 16;
 
     let mut phys = START;
-    // A valid RSDP starts with the 8-byte signature and continues for 20
-    // (ACPI 1.0) or 36 (ACPI 2.0+) bytes. The outer bound only needs to
-    // guarantee that the signature plus the 1.0 footprint is in range;
-    // the revision-specific 36-byte check is gated again below so we do
-    // not miss a 1.0 RSDP that sits in the last aligned slot.
     while phys + 20 <= END {
         let ptr = (phys_mem_offset + phys) as *const u8;
-        let sig = unsafe { core::slice::from_raw_parts(ptr, 8) };
-        if sig == SIG {
-            let first20 = unsafe { core::slice::from_raw_parts(ptr, 20) };
-            let sum20: u8 = first20.iter().fold(0u8, |a, b| a.wrapping_add(*b));
-            if sum20 != 0 {
-                phys += STEP;
-                continue;
-            }
-            let revision = unsafe { *ptr.add(15) };
-            if revision >= 2 {
-                if phys + 36 > END {
-                    // The RSDP claims ACPI 2.0+ but its extended tail
-                    // would run past the ROM window. Treat as malformed.
-                    phys += STEP;
-                    continue;
-                }
-                let full = unsafe { core::slice::from_raw_parts(ptr, 36) };
-                let sum36: u8 = full.iter().fold(0u8, |a, b| a.wrapping_add(*b));
-                if sum36 != 0 {
-                    // ACPI 1.0 checksum matched but extended one didn't —
-                    // reject: treating the XSDT pointer as valid would
-                    // feed garbage into `walk_xsdt`.
-                    phys += STEP;
-                    continue;
-                }
-            }
+        if unsafe { validate_rsdp(ptr, (END - phys) as usize) } {
             return Some(ptr);
         }
         phys += STEP;
@@ -275,14 +280,29 @@ unsafe fn parse_madt(madt: *const u8) -> AcpiInfo {
 /// so a malformed BIOS does not take the kernel down — SMP-d will see
 /// `ACPI.lock().as_ref().is_none()` and refuse to launch APs.
 ///
+/// `rsdp_addr` is the physical RSDP address as reported by the
+/// bootloader; the legacy BIOS ROM scan runs only when it is absent
+/// or fails validation.
+///
 /// # Safety
-/// Requires the bootloader's `map_physical_memory` mapping to be active
+/// Requires the bootloader's whole-physical-memory mapping to be active
 /// at `phys_mem_offset`, and must be called once during kernel init.
-pub unsafe fn init(phys_mem_offset: u64) {
-    let rsdp = match unsafe { find_rsdp(phys_mem_offset) } {
+pub unsafe fn init(phys_mem_offset: u64, rsdp_addr: Option<u64>) {
+    let reported = rsdp_addr.and_then(|phys| {
+        let ptr = (phys_mem_offset + phys) as *const u8;
+        // The full 36-byte footprint is readable through the offset
+        // mapping wherever the firmware placed it.
+        if unsafe { validate_rsdp(ptr, 36) } {
+            Some(ptr)
+        } else {
+            serial_println!("ACPI: bootloader RSDP at 0x{:x} failed validation", phys);
+            None
+        }
+    });
+    let rsdp = match reported.or_else(|| unsafe { find_rsdp(phys_mem_offset) }) {
         Some(p) => p,
         None => {
-            serial_println!("ACPI: RSDP not found in BIOS ROM region");
+            serial_println!("ACPI: RSDP not found (no bootloader report, scan empty)");
             return;
         }
     };

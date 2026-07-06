@@ -8,7 +8,77 @@ use bmdb_core::storage::BlockStorage;
 use bmdb_pci as pci;
 use bmdb_serial::serial_println;
 use core::ptr;
-use x86_64::{VirtAddr, structures::paging::Translate};
+use x86_64::structures::paging::mapper::MapToError;
+use x86_64::structures::paging::{
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
+};
+use x86_64::{PhysAddr, VirtAddr};
+
+/// Register space mapped before CAP can be read: the CAP/CC/CSTS/AQA/
+/// ASQ/ACQ block (offsets 0x00..0x38) plus the first doorbell page at
+/// 0x1000. Sufficient for every controller with a zero doorbell stride
+/// (all of QEMU and typical NVMe SSDs); a non-zero stride is covered by
+/// a second `map_bar` call once CAP.DSTRD is known.
+const BAR_INIT_LEN: usize = 0x2000;
+
+/// Map `[phys, phys+len)` at `phys_mem_offset + phys`, the address the
+/// register accessors below compute. The bootloader's offset window only
+/// spans RAM (+4 GiB); a PCI BAR the UEFI firmware placed above that
+/// window is otherwise unmapped and the first access double-faults.
+///
+/// Returns `false` (caller aborts) on any hard mapping error, or if a
+/// page is already mapped to a *different* physical frame — that would
+/// mean the chosen VA collides with live kernel state, and writing MMIO
+/// there would corrupt it. A page already mapped to the requested frame
+/// (a BAR inside the bootloader's offset window, e.g. under BIOS) is the
+/// expected in-window case and is accepted.
+#[must_use]
+fn map_bar(
+    mapper: &mut OffsetPageTable<'static>,
+    frame_alloc: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+    phys: u64,
+    len: usize,
+) -> bool {
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    let start = phys & !0xFFF;
+    let end = (phys + len as u64 + 0xFFF) & !0xFFF;
+    let mut p = start;
+    while p < end {
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(p));
+        let va = VirtAddr::new(phys_mem_offset.as_u64() + p);
+        let page = Page::<Size4KiB>::containing_address(va);
+        match unsafe { mapper.map_to(page, frame, flags, frame_alloc) } {
+            Ok(flush) => flush.flush(),
+            // Already covered by an existing 4 KiB entry, or by a huge
+            // page one level up (the bootloader maps the low 4 GiB —
+            // including the PCI hole where a BIOS-assigned BAR lives —
+            // with 2 MiB/1 GiB pages). Either is fine as long as it
+            // already resolves to the frame we want; a mismatch means
+            // the VA collides with unrelated kernel state.
+            Err(MapToError::PageAlreadyMapped(_)) | Err(MapToError::ParentEntryHugePage) => {
+                match mapper.translate_addr(va) {
+                    Some(pa) if pa.as_u64() == p => {}
+                    other => {
+                        serial_println!(
+                            "NVMe: BAR VA {:#x} already maps to {:?}, not {:#x}",
+                            va.as_u64(),
+                            other,
+                            p,
+                        );
+                        return false;
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("NVMe: BAR map failed at {:#x}: {:?}", p, e);
+                return false;
+            }
+        }
+        p += 4096;
+    }
+    true
+}
 
 // Controller register offsets (NVMe spec Section 3.1).
 const REG_CAP: usize = 0x00;
@@ -171,7 +241,11 @@ fn status_code(cqe: &CqEntry) -> u16 {
 /// Discover the NVMe controller, bring it up, and create one I/O queue pair.
 /// Returns a handle usable for block I/O, or `None` if no controller is
 /// present or initialization fails.
-pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) -> Option<Controller> {
+pub fn init(
+    phys_mem_offset: VirtAddr,
+    mapper: &mut OffsetPageTable<'static>,
+    frame_alloc: &mut impl FrameAllocator<Size4KiB>,
+) -> Option<Controller> {
     let addr = pci::find_device(0x01, 0x08)?;
     serial_println!(
         "NVMe: found at {:02x}:{:02x}.{}",
@@ -181,24 +255,35 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) -> Option<Contro
     );
     pci::enable_device(&addr);
 
-    let bar0 = pci::read_bar(&addr, 0);
+    let bar0 = match pci::read_bar(&addr, 0) {
+        pci::Bar::Mmio { addr } => addr,
+        pci::Bar::Io { port } => {
+            serial_println!("NVMe: BAR0 is I/O at {:#x}, expected memory", port);
+            return None;
+        }
+    };
+    serial_println!("NVMe: BAR0 = {:#x}", bar0);
+    if !map_bar(mapper, frame_alloc, phys_mem_offset, bar0, BAR_INIT_LEN) {
+        serial_println!("NVMe: failed to map controller registers");
+        return None;
+    }
     let base = (phys_mem_offset.as_u64() + bar0) as *mut u8;
 
     let cap = reg_read64(base, REG_CAP);
     let vs = reg_read32(base, REG_VS);
-    serial_println!("NVMe: BAR0 = {:#x}, CAP = {:#x}, VS = {:#x}", bar0, cap, vs);
+    serial_println!("NVMe: CAP = {:#x}, VS = {:#x}", cap, vs);
 
     reg_write32(base, REG_CC, 0);
     while reg_read32(base, REG_CSTS) & 1 != 0 {
         core::hint::spin_loop();
     }
 
-    let asq_phys = translate(mapper, &raw const ADMIN_SQ as u64);
-    let acq_phys = translate(mapper, &raw const ADMIN_CQ as u64);
-    let iosq_phys = translate(mapper, &raw const IO_SQ as u64);
-    let iocq_phys = translate(mapper, &raw const IO_CQ as u64);
-    let id_phys = translate(mapper, &raw const IDENTIFY_BUF as u64);
-    let data_phys = translate(mapper, &raw const DATA_BUF as u64);
+    let asq_phys = translate(&*mapper, &raw const ADMIN_SQ as u64);
+    let acq_phys = translate(&*mapper, &raw const ADMIN_CQ as u64);
+    let iosq_phys = translate(&*mapper, &raw const IO_SQ as u64);
+    let iocq_phys = translate(&*mapper, &raw const IO_CQ as u64);
+    let id_phys = translate(&*mapper, &raw const IDENTIFY_BUF as u64);
+    let data_phys = translate(&*mapper, &raw const DATA_BUF as u64);
 
     let aqa = (((ADMIN_QD - 1) as u32) << 16) | ((ADMIN_QD - 1) as u32);
     reg_write32(base, REG_AQA, aqa);
@@ -221,8 +306,20 @@ pub fn init(phys_mem_offset: VirtAddr, mapper: &impl Translate) -> Option<Contro
     }
     serial_println!("NVMe: controller enabled");
 
-    let dstrd = ((cap >> 32) >> 16) as usize & 0xF;
-    let stride = 4 << dstrd;
+    // CAP.DSTRD is bits 35:32 of CAP (NVMe spec §3.1.1). Doorbells live
+    // at 0x1000 + N*stride; the highest one used is the I/O CQ at
+    // 0x1000 + 3*stride. At DSTRD 0 that is inside the initial mapping,
+    // but a large stride pushes it past BAR_INIT_LEN, so map through it
+    // before any doorbell write.
+    let dstrd = ((cap >> 32) & 0xF) as usize;
+    let stride = 4usize << dstrd;
+    let doorbell_end = 0x1000 + 3 * stride + 4;
+    if doorbell_end > BAR_INIT_LEN
+        && !map_bar(mapper, frame_alloc, phys_mem_offset, bar0, doorbell_end)
+    {
+        serial_println!("NVMe: failed to map doorbell region");
+        return None;
+    }
 
     let mut admin = Queue {
         sq: &raw mut ADMIN_SQ as *mut SqEntry,

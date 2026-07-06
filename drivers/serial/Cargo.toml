@@ -8,6 +8,5 @@ test = false
 bench = false
 
 [dependencies]
-uart_16550.workspace = true
 spin.workspace = true
-lazy_static.workspace = true
+x86_64.workspace = true

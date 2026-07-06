@@ -1,4 +1,7 @@
-# Pin toolchain to nightly for build-std and json-target-spec.
+# Nightly is required for the kernel's `abi_x86_interrupt` feature and for
+# the bootloader 0.11 builder, which compiles its UEFI/BIOS stages from
+# source (hence rust-src + llvm-tools). The kernel itself now targets the
+# built-in `x86_64-unknown-none`, so no build-std or custom target spec.
 
 [toolchain]
 channel = "nightly"

@@ -1,0 +1,13 @@
+[package]
+name = "hw-runner"
+version.workspace = true
+edition.workspace = true
+
+# Host-side tool: builds the kernel ELF, wraps it into BIOS/UEFI disk
+# images and a PXE/TFTP folder (bootloader 0.11 builder API), boots it
+# under QEMU, and drives the real-hardware test loop over Intel AMT
+# (PXE boot + Serial-over-LAN capture).
+
+[dependencies]
+bootloader = "0.11"
+anyhow = "1"

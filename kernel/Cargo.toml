@@ -19,28 +19,10 @@ bench = []
 silo-bench = []
 
 [dependencies]
-bootloader.workspace = true
+bootloader_api.workspace = true
 x86_64.workspace = true
 lazy_static.workspace = true
 bmdb-core.workspace = true
 bmdb-serial.workspace = true
 bmdb-pci.workspace = true
 bmdb-nvme.workspace = true
-
-# QEMU flags used by `bootimage runner` when `cargo run`.
-# -display none keeps it headless; -serial stdio routes COM1 to the terminal.
-# The NVMe device is backed by nvme.img (created with `qemu-img create -f raw nvme.img 128M`).
-[package.metadata.bootimage]
-run-args = [
-    "-serial", "stdio",
-    "-display", "none",
-    "-smp", "4",
-    # KVM + host CPU passthrough. The silo-bench numbers without this
-    # flag carry a ~17x TCG emulation penalty that drowns OCC hot
-    # paths — keep it on by default. Requires `/dev/kvm` access; if
-    # `Could not access KVM kernel module: Permission denied` fires,
-    # `sudo usermod -aG kvm $USER` then log out and back in.
-    "-enable-kvm", "-cpu", "host",
-    "-drive", "file=nvme.img,format=raw,if=none,id=nvme0",
-    "-device", "nvme,serial=BMDB0001,drive=nvme0",
-]
