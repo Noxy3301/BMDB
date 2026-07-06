@@ -36,18 +36,23 @@ sudo ufw allow proto udp from 192.168.0.0/24 to any port 4011 comment 'BMDB PXE'
 
 ### 2. amtterm 1.7 (dev host)
 
-The distro `amtterm` (1.4) cannot authenticate to AMT 12. Build 1.7:
+The distro `amtterm` (1.4) reaches the AUTH phase but fails AMT 12's
+digest auth (`AUTH -> ERROR: session authentication failed`). Build 1.7
+(verified to reach `RUN_SOL` on this M920q, AMT 12.0.35):
 
 ```bash
 cd /tmp && curl -fsSLO https://github.com/kraxel/amtterm/archive/refs/tags/amtterm-1.7-1.tar.gz
 tar xf amtterm-1.7-1.tar.gz && cd amtterm-amtterm-1.7-1
-# The generated Make.config can carry an `echo -e` artefact; if `make`
-# fails on its first line, rewrite it to the four plain assignments.
+make amtterm    # writes Make.config, then builds
+# If make stops with "Make.config:1: *** empty variable name", its first
+# line has a stray `-e ` from the generator. Rewrite the four lines:
+printf 'LIB\t\t:= lib\nHAVE_GTK\t:= no\nHAVE_GDK\t:= no\nHAVE_VTE\t:= no\n' > Make.config
 make amtterm && install -D amtterm ~/.local/bin/amtterm17
 ```
 
 `hw-runner` looks for `$AMT_TERM`, then `~/.local/bin/amtterm17`; it never
-falls back to the useless distro 1.4.
+falls back to the useless distro 1.4. Needs `libssl-dev` and `pod2man`
+(perl) at build time.
 
 ## Per-session
 

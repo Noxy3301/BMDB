@@ -20,13 +20,35 @@ Usage: bmdb-amt.py {status|sol-enable|pxe-next|on|reset|off}
 
 import os
 import re
+import socket
 import sys
+from xml.sax.saxutils import escape
 
 import requests
 from requests.auth import HTTPDigestAuth
 
 import amt.client
 import amt.wsman
+
+# Bound every AMT network call so an unresponsive management engine can
+# never hang the automated hardware test. `socket.setdefaulttimeout` is
+# not enough on its own: requests/urllib3 turn an omitted timeout into an
+# explicit `None`, overriding the process default — so the amt.client
+# calls (status/pxe-next/on/reset) would stay unbounded. Wrap
+# `requests.post` (which every amt.client network call and our own
+# wsman_post go through) to inject a default timeout when none is given.
+AMT_TIMEOUT = 15
+socket.setdefaulttimeout(AMT_TIMEOUT)
+
+_orig_requests_post = requests.post
+
+
+def _post_with_timeout(*args, **kwargs):
+    kwargs.setdefault("timeout", AMT_TIMEOUT)
+    return _orig_requests_post(*args, **kwargs)
+
+
+requests.post = _post_with_timeout
 
 REDIR_URI = "http://intel.com/wbem/wscim/1/amt-schema/1/AMT_RedirectionService"
 
@@ -56,6 +78,7 @@ def wsman_post(uri, password, payload):
         headers={"content-type": "application/soap+xml;charset=UTF-8"},
         auth=HTTPDigestAuth("admin", password),
         data=payload,
+        timeout=AMT_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.content.decode("utf-8", "replace")
@@ -68,49 +91,66 @@ def cmd_status(client):
 
 
 def cmd_sol_enable(uri, password):
-    """GET the redirection service, flip ListenerEnabled true, PUT it back.
-
-    Round-tripping the live instance avoids guessing the exact property
-    set/order AMT expects in a Put body.
+    """GET the redirection service, then PUT it back with ListenerEnabled
+    true. The PUT re-emits the instance's own property values (so AMT sees
+    a complete, valid tuple) with the flag flipped, declares the schema
+    namespace on the resource element, and carries the four key selectors
+    in the header — AMT rejects a Put missing any of these with 400.
     """
-    body = wsman_post(uri, password, amt.wsman.get_request(uri, REDIR_URI))
+    from xml.etree import ElementTree as ET
 
-    if not re.search(r"ListenerEnabled\s*>\s*(?:true|1)\s*<", body, re.I):
-        # Extract the resource element verbatim and flip the flag.
-        m = re.search(r"(<(\w+):AMT_RedirectionService\b.*?</\2:AMT_RedirectionService>)",
-                      body, re.S)
-        if not m:
-            sys.exit("sol-enable: AMT_RedirectionService not found in GET response")
-        resource = re.sub(r"(<\w+:ListenerEnabled>)[^<]*(</\w+:ListenerEnabled>)",
-                          r"\g<1>true\g<2>", m.group(1))
-        put = _put_envelope(uri, resource)
-        wsman_post(uri, password, put)
+    ns = "{" + REDIR_URI + "}"
+    doc = ET.fromstring(wsman_post(uri, password, amt.wsman.get_request(uri, REDIR_URI)))
+    svc = doc.find(f".//{ns}AMT_RedirectionService")
+    if svc is None:
+        sys.exit("sol-enable: AMT_RedirectionService not found in GET response")
+
+    # Preserve the instance's property order; force ListenerEnabled true.
+    props = []
+    for child in svc:
+        name = child.tag[len(ns):] if child.tag.startswith(ns) else child.tag
+        value = "true" if name == "ListenerEnabled" else (child.text or "")
+        props.append((name, value))
+
+    wsman_post(uri, password, _put_envelope(uri, props))
 
     # Confirm.
     body = wsman_post(uri, password, amt.wsman.get_request(uri, REDIR_URI))
     ok = bool(re.search(r"ListenerEnabled\s*>\s*(?:true|1)\s*<", body, re.I))
-    print("ListenerEnabled=true" if ok else "ListenerEnabled still false")
+    print("ListenerEnabled=true (SoL listener open on 16994)" if ok else "ListenerEnabled still false")
     if not ok:
         sys.exit(1)
 
 
-def _put_envelope(uri, resource):
+def _put_envelope(uri, props):
+    keys = ("CreationClassName", "Name", "SystemCreationClassName", "SystemName")
+    prop_by_name = dict(props)
+    missing = [k for k in keys if not prop_by_name.get(k)]
+    if missing:
+        sys.exit(f"sol-enable: GET response missing key selector(s): {', '.join(missing)}")
+    body = f'<r:AMT_RedirectionService xmlns:r="{REDIR_URI}">' + "".join(
+        f"<r:{name}>{escape(value)}</r:{name}>" for name, value in props
+    ) + "</r:AMT_RedirectionService>"
+    selectors = "".join(
+        f'<wsman:Selector Name="{k}">{escape(prop_by_name[k])}</wsman:Selector>' for k in keys
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
         ' xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
         ' xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd">'
         "<s:Header>"
-        "<wsa:Action s:mustUnderstand=\"true\">"
+        '<wsa:Action s:mustUnderstand="true">'
         "http://schemas.xmlsoap.org/ws/2004/09/transfer/Put</wsa:Action>"
-        f"<wsa:To s:mustUnderstand=\"true\">{uri}</wsa:To>"
-        f"<wsman:ResourceURI s:mustUnderstand=\"true\">{REDIR_URI}</wsman:ResourceURI>"
-        "<wsa:MessageID s:mustUnderstand=\"true\">uuid:bmdb-sol-enable</wsa:MessageID>"
+        f'<wsa:To s:mustUnderstand="true">{uri}</wsa:To>'
+        f'<wsman:ResourceURI s:mustUnderstand="true">{REDIR_URI}</wsman:ResourceURI>'
+        '<wsa:MessageID s:mustUnderstand="true">uuid:bmdb-sol-enable</wsa:MessageID>'
         "<wsa:ReplyTo><wsa:Address>"
         "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
         "</wsa:Address></wsa:ReplyTo>"
+        f"<wsman:SelectorSet>{selectors}</wsman:SelectorSet>"
         "</s:Header>"
-        f"<s:Body>{resource}</s:Body>"
+        f"<s:Body>{body}</s:Body>"
         "</s:Envelope>"
     )
 

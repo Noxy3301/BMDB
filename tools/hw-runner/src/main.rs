@@ -22,7 +22,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bootloader::{BiosBoot, UefiBoot};
@@ -347,91 +347,125 @@ fn read_amt_env() -> Result<AmtEnv> {
     })
 }
 
-/// Path of the `amtctrl` WS-Management client (the classic `amttool`
-/// cannot drive AMT 12 power controls). Override with $AMT_CTRL.
-fn amtctrl_path() -> String {
-    std::env::var("AMT_CTRL").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.amt-venv/bin/amtctrl")
-    })
+/// The WS-Management helper that drives AMT power + the SoL listener.
+/// (`amttool` cannot drive AMT 12; this wraps the python `amt` client.)
+fn bmdb_amt_path() -> PathBuf {
+    workspace_root().join("tools/amt/bmdb-amt.py")
 }
 
-/// Ask AMT to force PXE on the next boot and power-cycle the box.
-/// `amtctrl -p <host>` reads the password from stdin, bypassing its
-/// host database so the runner has no state outside ~/.bmdb-amt.env.
-fn amt_pxeboot(amt: &AmtEnv) -> Result<()> {
-    let mut child = Command::new(amtctrl_path())
-        .args(["-p", &amt.host, "pxeboot"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("spawning amtctrl (pip install amt into ~/.amt-venv?)")?;
-    use std::io::Write;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(format!("{}\n", amt.password).as_bytes())?;
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("amtctrl pxeboot failed with {status}");
+/// Run one `bmdb-amt.py <cmd>` and return its trimmed stdout. Credentials
+/// come from ~/.bmdb-amt.env, which the script reads itself. Wrapped in
+/// `timeout` as a hard backstop so a wedged management-engine call can
+/// never hang the gate even if the script's own network timeout fails.
+fn bmdb_amt(cmd: &str) -> Result<String> {
+    let out = Command::new("timeout")
+        // -k: SIGKILL 5s after the SIGTERM if the child ignores it.
+        .args(["-k", "5", "30"])
+        .arg(bmdb_amt_path())
+        .arg(cmd)
+        .output()
+        .with_context(|| format!("running bmdb-amt.py {cmd}"))?;
+    if !out.status.success() {
+        // `timeout` exits 124 when it has to kill the child.
+        let code = out.status.code().unwrap_or(-1);
+        bail!(
+            "bmdb-amt.py {cmd} failed (exit {code}{}): {}",
+            if code == 124 { ", timed out" } else { "" },
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    println!("AMT: PXE boot requested, box is power-cycling");
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Watch the Serial-over-LAN stream until a marker or the deadline.
-/// The SoL session must already be open (or opened here) before the
-/// power cycle so no early output is lost.
-fn capture_sol(amt: &AmtEnv, timeout: Duration, log_path: &Path) -> Result<bool> {
-    let mut child = Command::new("amtterm")
+/// Path to amtterm 1.7 (`$AMT_TERM`, else ~/.local/bin/amtterm17). The
+/// distro amtterm 1.4 cannot authenticate to AMT 12, so there is no
+/// fallback to it.
+fn amtterm_path() -> Result<String> {
+    if let Ok(p) = std::env::var("AMT_TERM") {
+        return Ok(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let p = format!("{home}/.local/bin/amtterm17");
+    if Path::new(&p).exists() {
+        return Ok(p);
+    }
+    bail!(
+        "amtterm 1.7 not found at {p}; set $AMT_TERM or build it (see \
+         tools/pxe/README.md). The distro amtterm 1.4 cannot auth to AMT 12."
+    )
+}
+
+/// Open a Serial-over-LAN session and watch it until a success/failure
+/// marker or the deadline. A reader thread feeds a channel so the
+/// deadline holds even when the link stays completely silent — which is
+/// the normal state until BMDB's own kernel starts driving the KT UART
+/// (firmware POST and the UEFI PXE ROM do not print on SoL).
+fn capture_sol(amt: &AmtEnv, amtterm: &str, timeout: Duration, log_path: &Path) -> Result<bool> {
+    use std::io::Write;
+    use std::sync::mpsc;
+
+    let mut child = Command::new(amtterm)
         .arg(&amt.host)
         .env("AMT_PASSWORD", &amt.password)
-        .stdin(Stdio::null())
+        // Hold stdin open: amtterm exits on stdin EOF, so a closed or null
+        // stdin would drop the session immediately.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
-        .context("spawning amtterm (apt install amtterm?)")?;
+        .with_context(|| format!("spawning {amtterm}"))?;
 
+    let stdin = child.stdin.take(); // keep the handle alive for the child's lifetime
     let stdout = child.stdout.take().unwrap();
-    let mut log = fs::File::create(log_path)?;
-    let deadline = Instant::now() + timeout;
-    let mut passed = None;
+    let log_path_buf = log_path.to_path_buf();
 
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        use std::io::Write;
-        writeln!(log, "{line}")?;
-        println!("SOL| {line}");
-        if line.contains(SUCCESS_MARKER) {
-            passed = Some(true);
-            break;
+    // The reader thread mirrors every line to stdout and the log, and
+    // signals the outcome on the first marker. A silent link never sends,
+    // so the main thread's recv_timeout enforces the deadline.
+    let (tx, rx) = mpsc::channel::<bool>();
+    let reader = std::thread::spawn(move || {
+        let mut log = fs::File::create(&log_path_buf).ok();
+        for line in BufReader::new(stdout).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            println!("SOL| {line}");
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            if line.contains(SUCCESS_MARKER) {
+                let _ = tx.send(true);
+                return;
+            }
+            if line.contains(FAILURE_MARKER) {
+                let _ = tx.send(false);
+                return;
+            }
         }
-        if line.contains(FAILURE_MARKER) {
-            passed = Some(false);
-            break;
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
+    });
+
+    let outcome = rx.recv_timeout(timeout);
     let _ = child.kill();
     let _ = child.wait();
+    drop(stdin);
+    let _ = reader.join();
 
-    match passed {
-        Some(true) => {
+    match outcome {
+        Ok(true) => {
             println!("HW-TEST PASS (marker: {SUCCESS_MARKER:?})");
             Ok(true)
         }
-        Some(false) => {
+        Ok(false) => {
             println!("HW-TEST FAIL (kernel panicked — see {})", log_path.display());
             Ok(false)
         }
-        None => {
-            println!("HW-TEST TIMEOUT after {timeout:?} — see {}", log_path.display());
+        Err(_) => {
+            println!(
+                "HW-TEST TIMEOUT/silent after {timeout:?} — no marker on SoL. \
+                 Check the dnsmasq log: did the M920q DHCP and TFTP-fetch? See {}",
+                log_path.display()
+            );
             Ok(false)
         }
     }
@@ -439,28 +473,30 @@ fn capture_sol(amt: &AmtEnv, timeout: Duration, log_path: &Path) -> Result<bool>
 
 fn hw_test(opts: &Opts, artifacts: &Artifacts) -> Result<()> {
     let amt = read_amt_env()?;
+    let amtterm = amtterm_path()?;
     deploy(opts, artifacts)?;
 
-    // Open SoL first: AMT keeps exactly one redirection session, and
-    // opening it before the power cycle catches the earliest output.
-    let log_path = workspace_root().join("target/boot/hw-test.log");
-    println!("AMT: opening SoL to {} …", amt.host);
+    // Make sure the SoL listener is on (idempotent WS-Man Put).
+    println!("AMT: {}", bmdb_amt("sol-enable")?);
+    let state = bmdb_amt("status")?;
+    println!("AMT: power state = {state}");
 
-    // amtterm and the power command run concurrently: issue pxeboot
-    // from a helper thread once the SoL session had a moment to attach.
-    let amt2 = AmtEnv {
-        host: amt.host.clone(),
-        password: amt.password.clone(),
-    };
-    let power = std::thread::spawn(move || {
+    // Force PXE for the next boot, then power the box: on from off, reset
+    // if already running (a power cycle is rejected while SoL is open).
+    let power = std::thread::spawn(move || -> Result<()> {
+        // Let the SoL session attach first so no early output is missed.
         std::thread::sleep(Duration::from_secs(2));
-        amt_pxeboot(&amt2)
+        bmdb_amt("pxe-next")?;
+        let cmd = if state == "off" { "on" } else { "reset" };
+        println!("AMT: {}", bmdb_amt(cmd)?);
+        Ok(())
     });
 
-    let passed = capture_sol(&amt, opts.timeout, &log_path)?;
-    power
-        .join()
-        .map_err(|_| anyhow!("power thread panicked"))??;
+    let log_path = workspace_root().join("target/boot/hw-test.log");
+    println!("AMT: opening SoL to {} (via {amtterm}) …", amt.host);
+    let passed = capture_sol(&amt, &amtterm, opts.timeout, &log_path)?;
+
+    power.join().map_err(|_| anyhow!("power thread panicked"))??;
     if !passed {
         bail!("hardware test did not pass");
     }
