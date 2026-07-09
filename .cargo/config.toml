@@ -14,6 +14,8 @@ krun = ["run", "-p", "hw-runner", "--", "qemu"]
 # Latency microbench / concurrent Silo OCC workload under QEMU.
 kbench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "bench"]
 ksilobench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "silo-bench"]
+# Concurrent transactions through the lock-free B+tree index under QEMU.
+kenginebench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "engine-bench"]
 
 # Host-side unit tests for the pure-logic `core` crate.
 ctest = ["test", "--target", "x86_64-unknown-linux-gnu", "-p", "bmdb-core"]

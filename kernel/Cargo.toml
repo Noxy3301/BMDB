@@ -17,6 +17,10 @@ bench = []
 # `silo-bench` drives a concurrent Silo OCC workload across every AP and
 # a group-commit persist on the BSP. Mutually exclusive with `bench`.
 silo-bench = []
+# `engine-bench` drives full key-addressable transactions through the
+# lock-free concurrent B+tree index across every AP, measuring end-to-end
+# OCC + index throughput. Mutually exclusive with `bench` / `silo-bench`.
+engine-bench = []
 # `hw-loop` builds the unattended real-hardware test image: it brackets
 # the durability gate with a boot counter and raw-block / WAL probes, then
 # self-resets to run the next PXE image (AMT can't reset a box this

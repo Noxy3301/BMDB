@@ -4,10 +4,23 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+// The three benches replace the default workload and each other's AP
+// dispatch; enabling more than one would compile two `ap_worker`
+// dispatches (double-signalling `ONLINE_APS`) and two BSP workloads. They
+// are mutually exclusive by construction.
+#[cfg(any(
+    all(feature = "bench", feature = "silo-bench"),
+    all(feature = "bench", feature = "engine-bench"),
+    all(feature = "silo-bench", feature = "engine-bench"),
+))]
+compile_error!("features `bench`, `silo-bench`, and `engine-bench` are mutually exclusive");
+
 mod acpi;
 mod apic;
 #[cfg(feature = "bench")]
 mod bench;
+#[cfg(feature = "engine-bench")]
+mod engine_bench;
 mod gdt;
 mod interrupts;
 mod memory;
@@ -130,7 +143,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     bench::run_bench(&mut nvme);
     #[cfg(feature = "silo-bench")]
     silo_bench::run(&mut nvme, smp::online_aps());
-    #[cfg(not(any(feature = "bench", feature = "silo-bench")))]
+    #[cfg(feature = "engine-bench")]
+    engine_bench::run(&mut nvme, smp::online_aps());
+    #[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench")))]
     run_engine(&mut nvme);
 
     serial_println!("It did not crash!");
@@ -141,7 +156,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// feature it is bracketed by unattended real-hardware diagnostics — a
 /// boot counter and raw-block / WAL durability probes — that report over
 /// the video console during a self-resetting PXE test cycle.
-#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
+#[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench")))]
 fn run_engine(nvme: &mut bmdb_nvme::Controller) {
     #[cfg(feature = "hw-loop")]
     boot_counter(nvme);
@@ -170,7 +185,7 @@ fn finish() -> ! {
 /// the self-reset cycle even while the WAL path is under repair. A rising
 /// number across screenshots means the box is still cycling; a stuck
 /// number means a boot wedged before this point.
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench"))))]
+#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench"))))]
 fn boot_counter(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::lba_alloc::{BLOCK_SIZE, DATA_START};
 
@@ -226,7 +241,7 @@ fn delay_then_reset() -> ! {
 /// being dropped by the drive even though writes to the data region land
 /// — a region/LBA problem, not the write path. Also prints a build tag so
 /// the running image is unambiguous across the reboot loop.
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench"))))]
+#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench"))))]
 fn wal_readback(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::lba_alloc::{BLOCK_SIZE, WAL_START};
 
@@ -256,7 +271,7 @@ fn wal_readback(nvme: &mut bmdb_nvme::Controller) {
 /// back (proving the in-boot write/read path itself). On real hardware
 /// this separates "the write never reaches media" from "recovery logic
 /// drops it".
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench"))))]
+#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench"))))]
 fn nvme_selftest(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::lba_alloc::{BLOCK_SIZE, DATA_START};
 
@@ -327,7 +342,7 @@ fn nvme_selftest(nvme: &mut bmdb_nvme::Controller) {
 /// Runs on every boot; the recovered count grows by one per run, proving
 /// transactional durability across `timeout` / kill / restart cycles.
 /// Also exercises a durable multi-key transaction with a delete.
-#[cfg(not(any(feature = "bench", feature = "silo-bench")))]
+#[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench")))]
 fn engine_durable_gate(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::engine::Engine;
 
