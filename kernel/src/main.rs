@@ -480,5 +480,10 @@ fn hlt_loop() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("panic: {}", info);
-    hlt_loop();
+    // Under the hardware loop, self-reset instead of stranding the box —
+    // AMT cannot reset it while this driverless OS holds the shared NIC,
+    // so a wedged kernel would otherwise need a physical power cycle. The
+    // panic line stays on the video console through the reset delay. A
+    // plain build halts.
+    finish()
 }

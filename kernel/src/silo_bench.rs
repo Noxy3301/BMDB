@@ -432,17 +432,13 @@ pub fn run(nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     // Every worker is parked, so the `persist` contract (no live
     // commit buffering a log entry for an epoch about to be published)
     // is satisfied trivially.
-    let mut wal = match Wal::recover(nvme) {
-        Ok(w) => w,
-        Err(e) => {
-            serial_println!("SILO-BENCH Wal::recover failed: {:?}", e);
-            return;
-        }
-    };
-    serial_println!(
-        "SILO-BENCH wal recovered: next_lsn={}, starting persist",
-        wal.next_lsn(),
-    );
+    //
+    // Start from a fresh WAL each run rather than recovering the prior
+    // one: this is a throughput measurement, not a durability test, and
+    // recovering would advance the cursor every boot until the fixed WAL
+    // region overflows under the self-resetting hardware loop.
+    let mut wal = Wal::new();
+    serial_println!("SILO-BENCH starting persist from a fresh WAL");
 
     let t0 = rdtsc();
     let (persist_result, logged) =
