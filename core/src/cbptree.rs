@@ -42,6 +42,10 @@ const CHILD_SLOTS: usize = ORDER;
 /// Nodes the pool can hand out. Overflow -> `PoolExhausted`.
 pub const POOL_SIZE: usize = 256;
 
+/// Maximum tree height the insert path buffer supports. Far above any
+/// height a `POOL_SIZE` pool can reach (branching factor `ORDER`).
+const MAX_DEPTH: usize = 16;
+
 pub type NodeId = u32;
 pub const NULL_NODE: NodeId = u32::MAX;
 
@@ -384,6 +388,38 @@ impl Node {
         self.n_keys.store((n + 1) as u8, Ordering::Relaxed);
         true
     }
+
+    /// Split this full internal node, moving the upper half into `right`
+    /// (a fresh, unpublished node) and returning the promoted median key
+    /// (which goes up to the parent, not into either half). `self` keeps
+    /// `keys[0..mid)` / `children[0..mid]`; `right` gets `keys[mid+1..n)` /
+    /// `children[mid+1..n+1)`. Sets the B-link fences; the caller wires
+    /// `next_leaf` with the sibling ids.
+    ///
+    /// # Safety
+    /// `self` must be a full internal node under the writer lock; `right`
+    /// an unpublished fresh node.
+    unsafe fn internal_split_into(&self, right: &Node) -> Key {
+        let n = self.n_keys.load(Ordering::Relaxed) as usize;
+        let mid = n / 2;
+        let median = self.keys[mid].load(Ordering::Relaxed);
+        let mut j = 0;
+        for i in (mid + 1)..n {
+            right.keys[j].store(self.keys[i].load(Ordering::Relaxed), Ordering::Relaxed);
+            j += 1;
+        }
+        for (cj, c) in ((mid + 1)..(n + 1)).enumerate() {
+            right.children[cj].store(self.children[c].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        right.kind.store(NodeKind::Internal as u8, Ordering::Relaxed);
+        right.n_keys.store(j as u8, Ordering::Relaxed);
+        // B-link fences: `right` inherits self's old upper bound; self's new
+        // upper bound is the promoted median.
+        right.high_key.store(self.high_key.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.high_key.store(median, Ordering::Relaxed);
+        self.n_keys.store(mid as u8, Ordering::Relaxed);
+        median.to_be_bytes()
+    }
 }
 
 /// Outcome of a successful [`Tree::insert`].
@@ -493,14 +529,19 @@ impl Tree {
             self.root.store(root, Ordering::Release);
         }
 
-        // Descend to the target leaf, remembering its immediate parent so a
-        // split can hand the separator up. One internal level for now.
-        let mut parent: Option<NodeId> = None;
+        // Descend to the target leaf, recording the full path of internal
+        // ancestors so a split can cascade the separator upward.
+        let mut path = [NULL_NODE; MAX_DEPTH];
+        let mut depth = 0usize;
         let mut node_id = root;
         while NodeKind::from_u8(self.node(node_id).kind.load(Ordering::Acquire))
             == NodeKind::Internal
         {
-            parent = Some(node_id);
+            if depth >= MAX_DEPTH {
+                return Err(InsertError::TreeTooDeep);
+            }
+            path[depth] = node_id;
+            depth += 1;
             // Safety: single writer; internal layout is stable here.
             node_id = unsafe { self.node(node_id).internal_descend(key) };
         }
@@ -513,90 +554,127 @@ impl Tree {
                 leaf.unlock_bump_insert();
                 Ok(ins)
             }
-            // `split_leaf_and_insert` owns the leaf's unlock on every path.
-            LeafPut::Full => self.split_leaf_and_insert(node_id, parent, key, value),
+            // `split_and_propagate` owns the leaf's unlock on every path.
+            LeafPut::Full => self.split_and_propagate(node_id, &path, depth, root, key, value),
         }
     }
 
-    /// The leaf `leaf_id` is full. Split it, insert `key`, and hand the
-    /// separator to `parent` (or grow a new root when the leaf was the
-    /// root). Caller holds the writer lock and `leaf_id` is locked; this
-    /// releases that lock on every path.
-    fn split_leaf_and_insert(
+    /// The leaf `leaf_id` is full. Split it, then cascade the separator up
+    /// `path[0..depth]`, splitting any full internal ancestor, and grow a
+    /// new root if the split reaches the top. Caller holds the writer lock
+    /// and `leaf_id` is locked; this releases that lock on every path.
+    ///
+    /// Correctness against readers uses the Lehman-Yao B-link right links:
+    /// each split sets the left node's `next_leaf` to its new right sibling
+    /// before unlocking, so the sibling is reachable via the link the moment
+    /// the (truncated) left node becomes visible — the parent pointer is
+    /// only an optimization that shortens future descents.
+    fn split_and_propagate(
         &self,
         leaf_id: NodeId,
-        parent: Option<NodeId>,
+        path: &[NodeId; MAX_DEPTH],
+        depth: usize,
+        root: NodeId,
         key: &Key,
         value: Value,
     ) -> Result<Inserted, InsertError> {
         let leaf = self.node(leaf_id);
 
-        // Bail before mutating anything if the split can't be absorbed: a
-        // full parent would need an internal split (not implemented yet).
-        if let Some(pid) = parent {
-            if self.node(pid).n_keys.load(Ordering::Relaxed) as usize >= MAX_KEYS {
-                leaf.unlock_bump_insert();
-                return Err(InsertError::TreeTooDeep);
-            }
-        }
-        // Allocate every node we might need up front, so once the split
-        // mutates the leaf there is no fallible step left that could leave
-        // the tree inconsistent.
-        let right_id = match self.alloc(NodeKind::Leaf) {
+        // Pre-allocate every node the cascade might need, so once we start
+        // mutating there is no fallible step that could wedge the tree: one
+        // right leaf, plus up to `depth` right internals and one new root.
+        let right_leaf = match self.alloc(NodeKind::Leaf) {
             Some(id) => id,
             None => {
                 leaf.unlock_bump_insert();
                 return Err(InsertError::PoolExhausted);
             }
         };
-        let new_root_id = if parent.is_none() {
+        let mut spares = [NULL_NODE; MAX_DEPTH + 1];
+        for spare in spares.iter_mut().take(depth + 1) {
             match self.alloc(NodeKind::Internal) {
-                Some(id) => Some(id),
+                // Unused spares just leak in the bump pool; harmless.
+                Some(id) => *spare = id,
                 None => {
-                    // right_id leaks in the bump pool; the leaf is untouched.
                     leaf.unlock_bump_insert();
                     return Err(InsertError::PoolExhausted);
                 }
             }
-        } else {
-            None
-        };
-        let right = self.node(right_id);
+        }
 
+        // Split the leaf.
         leaf.version.fetch_or(SPLITTING, Ordering::Release);
+        let right = self.node(right_leaf);
         // Safety: writer lock held; `right` is fresh and unpublished.
         let sep = unsafe { leaf.leaf_split_into(right) };
-        // Link the leaf chain: right takes over leaf's successor.
         right.next_leaf.store(leaf.next_leaf.load(Ordering::Relaxed), Ordering::Relaxed);
-        leaf.next_leaf.store(right_id, Ordering::Relaxed);
-
-        // Insert the new key into whichever half owns it — guaranteed room.
+        leaf.next_leaf.store(right_leaf, Ordering::Relaxed);
         let target = if key_word(key) < key_word(&sep) { leaf } else { right };
-        // Safety: leaf is locked; `right` is unpublished — both exclusive.
+        // Safety: exclusive under the lock / unpublished; room guaranteed.
         let ins = match unsafe { target.leaf_insert(key, value) } {
             LeafPut::Done(i) => i,
             LeafPut::Full => unreachable!("half of a fresh split always has room"),
         };
-        // Give `right` a clean, published version before it becomes visible.
         right.version.store(0, Ordering::Release);
-
-        // Make `right` reachable BEFORE unlocking the left leaf, so a reader
-        // never observes the truncated left half without the moved keys
-        // reachable elsewhere. Readers that descend while the left leaf is
-        // still SPLITTING simply restart.
-        match (parent, new_root_id) {
-            (None, Some(root_id)) => self.install_root(root_id, leaf_id, &sep, right_id),
-            (Some(pid), None) => {
-                let p = self.node(pid);
-                p.lock();
-                // Safety: writer lock + node lock held; room was verified.
-                unsafe { p.internal_insert(&sep, right_id) };
-                p.unlock_bump_insert();
-            }
-            _ => unreachable!("root-grow allocates a root iff there is no parent"),
-        }
-        // Now the moved keys are reachable; release the left leaf.
+        // `right` is now reachable via `leaf.next_leaf`; release the leaf.
         leaf.unlock_bump_split();
+
+        // Cascade (cur_sep, cur_right) up the ancestors.
+        let mut cur_sep = sep;
+        let mut cur_right = right_leaf;
+        let mut spare_idx = 0usize;
+        // Stays true only if the cascade runs off the top and needs a new root.
+        let mut grow = true;
+        for level in (0..depth).rev() {
+            let parent = self.node(path[level]);
+            parent.lock();
+            // Safety: writer lock + node lock held.
+            if unsafe { parent.internal_insert(&cur_sep, cur_right) } {
+                parent.unlock_bump_insert();
+                grow = false;
+                break;
+            }
+            // Parent is full: split it, promoting a median further up.
+            let new_int = spares[spare_idx];
+            spare_idx += 1;
+            parent.version.fetch_or(SPLITTING, Ordering::Release);
+            let ni = self.node(new_int);
+            // Safety: parent locked; `ni` fresh and unpublished.
+            let median = unsafe { parent.internal_split_into(ni) };
+            ni.next_leaf.store(parent.next_leaf.load(Ordering::Relaxed), Ordering::Relaxed);
+            parent.next_leaf.store(new_int, Ordering::Relaxed);
+            // Insert (cur_sep, cur_right) into whichever half owns it.
+            let ok = if key_word(&cur_sep) < key_word(&median) {
+                unsafe { parent.internal_insert(&cur_sep, cur_right) }
+            } else {
+                unsafe { ni.internal_insert(&cur_sep, cur_right) }
+            };
+            debug_assert!(ok, "a half of a fresh internal split always has room");
+            ni.version.store(0, Ordering::Release);
+            // `new_int` is reachable via `parent.next_leaf`; release parent.
+            parent.unlock_bump_split();
+            cur_sep = median;
+            cur_right = new_int;
+        }
+
+        if grow {
+            // The split ran off the top; grow a new root over it. The old top
+            // is the root we started from (the leaf itself when the tree was a
+            // single leaf, else the topmost internal on the path).
+            let old_top = if depth == 0 { leaf_id } else { root };
+            self.install_root(spares[spare_idx], old_top, &cur_sep, cur_right);
+            spare_idx += 1;
+        }
+
+        // Return the internal spares we over-provisioned but never used. We
+        // allocate `right_leaf` then `depth + 1` spares contiguously, so the
+        // unused ones (`spares[spare_idx..]`) are the top of the bump region;
+        // none were published and we alone hold the writer lock, so no other
+        // allocation can sit above them. Rewinding `alloc_next` reclaims them.
+        let unused = (depth + 1) - spare_idx;
+        if unused > 0 {
+            self.alloc_next.fetch_sub(unused as u32, Ordering::AcqRel);
+        }
         Ok(ins)
     }
 
@@ -654,6 +732,11 @@ impl Tree {
                 // Safety: bracketed by the version check below.
                 let child = if kind == NodeKind::Leaf {
                     None
+                } else if key_word(key) >= node.high_key.load(Ordering::Acquire)
+                    && node.next_leaf.load(Ordering::Acquire) != NULL_NODE
+                {
+                    // Internal B-link: follow the right sibling.
+                    Some(node.next_leaf.load(Ordering::Acquire))
                 } else {
                     Some(unsafe { node.internal_descend(key) })
                 };
@@ -793,6 +876,16 @@ impl Tree {
                 }
             },
             NodeKind::Internal => {
+                // B-link, internal level: if the key is at or past this
+                // node's fence, a split moved the covering subtree to the
+                // right sibling after we routed here — follow the right link
+                // instead of descending a now-wrong child.
+                if key_word(key) >= node.high_key.load(Ordering::Acquire) {
+                    let right = node.next_leaf.load(Ordering::Acquire);
+                    if right != NULL_NODE {
+                        return Some(NextStep::Descend(right));
+                    }
+                }
                 let next = unsafe { node.internal_descend(key) };
                 if next == NULL_NODE {
                     // Malformed — internal nodes always have at
@@ -1011,27 +1104,20 @@ mod tests {
 
     #[test]
     fn many_inserts_across_multiple_splits() {
-        // Enough keys to split several leaves under one internal root. Insert
-        // in a scrambled order so both halves of splits get exercised.
+        // Enough keys to cascade splits through several internal levels.
+        // Insert in a scrambled order so both halves of every split get
+        // exercised; with recursive internal splits every key must survive.
         let t = Tree::new();
-        let n = 100u64;
+        let n = 200u64;
         for i in 0..n {
             let x = (i.wrapping_mul(37) + 11) % n; // pseudo-shuffle, distinct
-            let _ = t.insert(k(x), x + 1); // may hit TreeTooDeep past one level
-        }
-        // Re-insert densely to be sure every key that fit is present.
-        let mut present = 0;
-        for x in 0..n {
-            if t.insert(k(x), x + 1).is_ok() {
-                present += 1;
-            }
+            t.insert(k(x), x + 1).expect("insert must not fail below pool size");
         }
         for x in 0..n {
-            if let Some(v) = t.lookup(&k(x)) {
-                assert_eq!(v, x + 1, "key {x} has the wrong value");
-            }
+            assert_eq!(t.lookup(&k(x)), Some(x + 1), "key {x} lost or wrong value");
         }
-        assert!(present > MAX_KEYS as u64, "tree did not grow past one leaf");
+        // A key never inserted must read absent (right down the split fences).
+        assert_eq!(t.lookup(&k(n)), None);
     }
 
     #[test]
@@ -1264,5 +1350,73 @@ mod tests {
         }
         done.store(true, O::Release);
         scanner.join().unwrap();
+    }
+
+    #[test]
+    fn deep_tree_keeps_every_key_and_scans_in_order() {
+        use std::vec::Vec;
+
+        // A single internal root fans out to CHILD_SLOTS (16) leaves; past
+        // ~16 * (MAX_KEYS/2) keys the root itself must split, forcing a second
+        // internal level. Insert well beyond that so the cascade runs, and
+        // check no key is lost and the leaf chain stays globally ordered.
+        let t = Tree::new();
+        let n = 220u64;
+        for i in 0..n {
+            // A full-period LCG over [0, n): distinct, scrambled order so both
+            // sides of every leaf and internal split are exercised.
+            let x = (i.wrapping_mul(97).wrapping_add(41)) % n;
+            t.insert(k(x), x + 1).expect("insert must not fail below pool size");
+        }
+        for x in 0..n {
+            assert_eq!(t.lookup(&k(x)), Some(x + 1), "key {x} lost in a deep tree");
+        }
+        // Full range walks the whole leaf chain: every key once, ascending.
+        let mut seen: Vec<u64> = Vec::new();
+        t.range(&k(0), &k(u64::MAX), |key, v| {
+            let kx = u64::from_be_bytes(key);
+            assert_eq!(v, kx + 1);
+            seen.push(kx);
+        });
+        let expected: Vec<u64> = (0..n).collect();
+        assert_eq!(seen, expected, "deep-tree range: all keys, in order");
+    }
+
+    #[test]
+    fn reader_survives_cascading_internal_splits() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
+        use std::thread;
+
+        // Push the writer past the single-internal-level boundary so the root
+        // itself splits under a concurrent reader. Every already-committed key
+        // must stay continuously visible through the whole restructuring — the
+        // B-link at both the leaf and internal levels is what guarantees it.
+        let t = Arc::new(Tree::new());
+        let committed = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let tr = Arc::clone(&t);
+        let cr = Arc::clone(&committed);
+        let dr = Arc::clone(&done);
+        let reader = thread::spawn(move || {
+            while !dr.load(O::Acquire) {
+                let hi = cr.load(O::Acquire);
+                for x in 0..hi {
+                    assert_eq!(tr.lookup(&k(x)), Some(x + 1), "committed key {x} vanished");
+                }
+            }
+        });
+
+        let n = 220u64; // forces several internal-node splits
+        for x in 0..n {
+            t.insert(k(x), x + 1).expect("insert must not fail below pool size");
+            committed.store(x + 1, O::Release);
+        }
+        done.store(true, O::Release);
+        reader.join().unwrap();
+        for x in 0..n {
+            assert_eq!(t.lookup(&k(x)), Some(x + 1));
+        }
     }
 }
