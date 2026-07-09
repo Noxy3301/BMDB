@@ -634,6 +634,105 @@ impl Tree {
         }
     }
 
+    /// Lock-free descent to the leaf whose range covers `key`, returning its
+    /// id (or None for an empty tree). Retries from the root on any
+    /// in-flight writer, like `lookup`.
+    fn leaf_for_read(&self, key: &Key) -> Option<NodeId> {
+        'restart: loop {
+            let mut id = self.root.load(Ordering::Acquire);
+            if id == NULL_NODE {
+                return None;
+            }
+            loop {
+                let node = self.node(id);
+                let v1 = node.load_version(Ordering::Acquire);
+                if v1.is_locked() || v1.is_inserting() || v1.is_splitting() {
+                    core::hint::spin_loop();
+                    continue 'restart;
+                }
+                let kind = NodeKind::from_u8(node.kind.load(Ordering::Acquire));
+                // Safety: bracketed by the version check below.
+                let child = if kind == NodeKind::Leaf {
+                    None
+                } else {
+                    Some(unsafe { node.internal_descend(key) })
+                };
+                let v2 = node.load_version(Ordering::Acquire);
+                if v1 != v2 || v2.is_inserting() || v2.is_splitting() {
+                    core::hint::spin_loop();
+                    continue 'restart;
+                }
+                match child {
+                    None => return Some(id),
+                    Some(next) => id = next,
+                }
+            }
+        }
+    }
+
+    /// Visit every `(key, value)` with `start <= key < end`, in ascending
+    /// key order. Lock-free: each leaf is emitted from a version-stable
+    /// snapshot and the B-link `next_leaf` chain is followed across leaf
+    /// boundaries. Per-leaf consistent, but not a single linearizable
+    /// snapshot of the whole range — a key inserted concurrently mid-scan
+    /// may or may not appear.
+    pub fn range<F: FnMut(Key, Value)>(&self, start: &Key, end: &Key, mut visit: F) {
+        let start_w = key_word(start);
+        let end_w = key_word(end);
+        if start_w >= end_w {
+            return;
+        }
+        let mut leaf_id = match self.leaf_for_read(start) {
+            Some(id) => id,
+            None => return,
+        };
+        loop {
+            let leaf = self.node(leaf_id);
+            let mut buf: [(u64, u64); MAX_KEYS] = [(0, 0); MAX_KEYS];
+            let count;
+            let next;
+            let reached_end;
+            // Snapshot this leaf's in-range entries under version validation.
+            loop {
+                let v1 = leaf.load_version(Ordering::Acquire);
+                if v1.is_locked() || v1.is_inserting() || v1.is_splitting() {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                let mut c = 0;
+                let mut done = false;
+                let n = (leaf.n_keys.load(Ordering::Acquire) as usize).min(MAX_KEYS);
+                for i in 0..n {
+                    let kw = leaf.keys[i].load(Ordering::Acquire);
+                    if kw >= end_w {
+                        done = true;
+                        break;
+                    }
+                    if kw >= start_w {
+                        buf[c] = (kw, leaf.values[i].load(Ordering::Acquire));
+                        c += 1;
+                    }
+                }
+                let nl = leaf.next_leaf.load(Ordering::Acquire);
+                let v2 = leaf.load_version(Ordering::Acquire);
+                if v1 == v2 && !v2.is_inserting() && !v2.is_splitting() {
+                    count = c;
+                    next = nl;
+                    reached_end = done;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            for &(kw, v) in buf.iter().take(count) {
+                visit(kw.to_be_bytes(), v);
+            }
+            if reached_end || next == NULL_NODE {
+                return;
+            }
+            leaf_id = next;
+        }
+    }
+
     /// Recursive-ish descent, returns `None` when the caller must
     /// restart from the root and `Some(x)` when the descent produced
     /// a linearizable answer (`x` is the lookup result).
@@ -1064,5 +1163,106 @@ mod tests {
         for y in 0..x {
             assert_eq!(t.lookup(&k(y)), Some(y + 1));
         }
+    }
+
+    #[test]
+    fn range_scans_in_key_order_across_splits() {
+        use std::vec::Vec;
+
+        let t = Tree::new();
+        // Insert (in order) enough keys to build a multi-leaf tree.
+        let mut inserted: Vec<u64> = Vec::new();
+        let mut x = 0u64;
+        while t.insert(k(x), x + 1).is_ok() {
+            inserted.push(x);
+            x += 1;
+            if x > 60 {
+                break;
+            }
+        }
+        assert!(inserted.len() > MAX_KEYS, "tree never split");
+
+        // Full range yields every key, ascending, with the right value.
+        let mut seen: Vec<u64> = Vec::new();
+        t.range(&k(0), &k(u64::MAX), |key, v| {
+            let kx = u64::from_be_bytes(key);
+            assert_eq!(v, kx + 1);
+            seen.push(kx);
+        });
+        assert_eq!(seen, inserted, "full range: all keys, in order");
+
+        // Bounded [10, 20): start inclusive, end exclusive.
+        let mut mid: Vec<u64> = Vec::new();
+        t.range(&k(10), &k(20), |key, _| mid.push(u64::from_be_bytes(key)));
+        let expected: Vec<u64> = inserted
+            .iter()
+            .copied()
+            .filter(|&y| (10..20).contains(&y))
+            .collect();
+        assert_eq!(mid, expected);
+
+        // Empty ranges yield nothing.
+        let mut n = 0;
+        t.range(&k(20), &k(20), |_, _| n += 1);
+        t.range(&k(30), &k(10), |_, _| n += 1);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn range_on_single_leaf_and_empty_tree() {
+        use std::vec::Vec;
+        let t = Tree::new();
+        // Empty tree: nothing.
+        let mut n = 0;
+        t.range(&k(0), &k(100), |_, _| n += 1);
+        assert_eq!(n, 0);
+
+        for x in [3u64, 1, 4, 1, 5, 9, 2, 6] {
+            let _ = t.insert(k(x), x * 10);
+        }
+        let mut seen: Vec<u64> = Vec::new();
+        t.range(&k(2), &k(6), |key, v| {
+            let kx = u64::from_be_bytes(key);
+            assert_eq!(v, kx * 10);
+            seen.push(kx);
+        });
+        assert_eq!(seen, std::vec![2u64, 3, 4, 5]);
+    }
+
+    #[test]
+    fn range_scan_is_safe_under_concurrent_splits() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::thread;
+
+        // A scanner repeatedly walks the whole range while a writer inserts
+        // and splits. Every emitted pair must be well-formed (value == key+1)
+        // and strictly ascending, and the scan must never hang or fault.
+        let t = Arc::new(Tree::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let tr = Arc::clone(&t);
+        let dr = Arc::clone(&done);
+        let scanner = thread::spawn(move || {
+            while !dr.load(O::Acquire) {
+                let mut last: Option<u64> = None;
+                tr.range(&k(0), &k(u64::MAX), |key, v| {
+                    let kx = u64::from_be_bytes(key);
+                    assert_eq!(v, kx + 1, "range saw a mismatched value");
+                    if let Some(l) = last {
+                        assert!(kx > l, "range out of order: {l} then {kx}");
+                    }
+                    last = Some(kx);
+                });
+            }
+        });
+        let mut x = 0u64;
+        while t.insert(k(x), x + 1).is_ok() {
+            x += 1;
+            if x > 60 {
+                break;
+            }
+        }
+        done.store(true, O::Release);
+        scanner.join().unwrap();
     }
 }
