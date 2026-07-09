@@ -86,6 +86,7 @@ dependencies = [
 name = "bmdb-serial"
 version = "0.1.0"
 dependencies = [
+ "font8x8",
  "spin 0.5.2",
  "x86_64",
 ]
@@ -180,6 +181,12 @@ dependencies = [
  "byteorder",
  "log",
 ]
+
+[[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "funty"

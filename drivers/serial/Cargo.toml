@@ -10,3 +10,4 @@ bench = false
 [dependencies]
 spin.workspace = true
 x86_64.workspace = true
+font8x8 = { version = "0.3.1", default-features = false }

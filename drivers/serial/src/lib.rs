@@ -20,7 +20,11 @@
 
 #![no_std]
 
+mod fb;
+pub use fb::PixelKind;
+
 use core::fmt;
+use fb::FbConsole;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -169,6 +173,7 @@ enum Com1 {
 struct Console {
     com1: Com1,
     kt: Option<Uart>,
+    fb: Option<FbConsole>,
 }
 
 // The MMIO variant holds a raw pointer, which is !Send by default. All
@@ -179,6 +184,7 @@ unsafe impl Send for Console {}
 static CONSOLE: Mutex<Console> = Mutex::new(Console {
     com1: Com1::Unprobed,
     kt: None,
+    fb: None,
 });
 
 /// Legacy COM1 I/O port. Standard on every x86 PC that has the device;
@@ -201,6 +207,9 @@ impl Console {
         if let Some(u) = &mut self.kt {
             u.put_str(s);
         }
+        if let Some(fb) = &mut self.fb {
+            fb.put_str(s);
+        }
     }
 }
 
@@ -219,6 +228,28 @@ impl fmt::Write for ConsoleWriter<'_> {
 /// # Safety
 /// `port` must be the I/O BAR base of a 16550-compatible function whose
 /// I/O decoding is enabled, and must stay valid for the rest of the run.
+/// Attach a linear framebuffer as a console sink. Mirrors every line to
+/// the video output, the only console that survives on boxes with no
+/// serial port and unusable AMT SoL.
+///
+/// # Safety
+/// `buf`/`len` must describe a valid, writable framebuffer mapping that
+/// stays valid for the rest of the run, with the given `stride` (pixels
+/// per scanline), `bpp` (bytes per pixel) and pixel `kind`.
+pub unsafe fn install_fb(
+    buf: *mut u8,
+    len: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    bpp: usize,
+    kind: PixelKind,
+    scale: usize,
+) {
+    let console = unsafe { FbConsole::new(buf, len, width, height, stride, bpp, kind, scale) };
+    CONSOLE.lock().fb = Some(console);
+}
+
 pub unsafe fn install_kt_pio(port: u16) -> bool {
     let uart = unsafe { Uart::probe(Regs::Pio { base: port }) };
     let found = uart.is_some();
