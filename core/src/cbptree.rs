@@ -20,7 +20,14 @@
 //! This module currently ships the layout + lookup path; insert,
 //! split, and delete land in follow-up commits.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+/// Interpret a key as a `u64` so it can live in an atomic cell. Keys are
+/// compared lexicographically; big-endian bytes make the `u64` order match.
+#[inline]
+const fn key_word(key: &Key) -> u64 {
+    u64::from_be_bytes(*key)
+}
 
 pub type Key = [u8; 8];
 /// Opaque 8-byte payload. For the KV crate this is a value; for the
@@ -38,41 +45,56 @@ pub const POOL_SIZE: usize = 256;
 pub type NodeId = u32;
 pub const NULL_NODE: NodeId = u32::MAX;
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
-    Leaf,
-    Internal,
+    Leaf = 0,
+    Internal = 1,
+}
+
+impl NodeKind {
+    #[inline]
+    const fn from_u8(v: u8) -> Self {
+        if v == NodeKind::Internal as u8 {
+            NodeKind::Internal
+        } else {
+            NodeKind::Leaf
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
-// Version word.
+// Version word (64-bit).
 //
-// Masstree EuroSys 2012 §3.2, slightly modified for u32 width on a
-// fixed-pool tree:
-//   bit  0:  locked     (writer holds the latch)
-//   bit  1:  inserting  (a writer is mid-insert; readers retry)
-//   bit  2:  splitting  (a writer is mid-split; readers retry and
-//                        re-descend if v_split changes)
-//   bit  3:  deleted    (node is retired; EBR will reclaim)
-//   bits 4..19 (16):   v_insert — bumped on each completed insert
-//   bits 20..31 (12):  v_split  — bumped on each completed split
+// Masstree EuroSys 2012 §3.2. A 64-bit word gives the sequence counters
+// enough width that they cannot wrap within any realistic reader window
+// — a 32-bit `v_insert` would need 2^32 completed inserts on this exact
+// node between a reader's two version loads to alias (ABA), which cannot
+// happen (the node splits long before). Layout:
+//   bit  0:      locked     (writer holds the latch)
+//   bit  1:      inserting  (a writer is mid-insert; readers retry)
+//   bit  2:      splitting  (a writer is mid-split; readers retry and
+//                            re-descend if v_split changes)
+//   bit  3:      deleted    (node is retired; EBR will reclaim)
+//   bits 4..35 (32):   v_insert — bumped on each completed insert
+//   bits 36..63 (28):  v_split  — bumped on each completed split
 // ---------------------------------------------------------------------
 
-const LOCKED: u32 = 1 << 0;
-const INSERTING: u32 = 1 << 1;
-const SPLITTING: u32 = 1 << 2;
-const DELETED: u32 = 1 << 3;
+const LOCKED: u64 = 1 << 0;
+const INSERTING: u64 = 1 << 1;
+const SPLITTING: u64 = 1 << 2;
+const DELETED: u64 = 1 << 3;
 const V_INSERT_SHIFT: u32 = 4;
-const V_INSERT_BITS: u32 = 16;
-const V_INSERT_MASK: u32 = ((1u32 << V_INSERT_BITS) - 1) << V_INSERT_SHIFT;
+const V_INSERT_BITS: u32 = 32;
+const V_INSERT_MASK: u64 = ((1u64 << V_INSERT_BITS) - 1) << V_INSERT_SHIFT;
 const V_SPLIT_SHIFT: u32 = V_INSERT_SHIFT + V_INSERT_BITS;
-const V_SPLIT_BITS: u32 = 12;
-const V_SPLIT_MASK: u32 = ((1u32 << V_SPLIT_BITS) - 1) << V_SPLIT_SHIFT;
+const V_SPLIT_BITS: u32 = 28;
+const V_SPLIT_MASK: u64 = ((1u64 << V_SPLIT_BITS) - 1) << V_SPLIT_SHIFT;
 
 /// Thin decode wrapper so callers can reason about the word without
 /// memorising bit offsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Version(pub u32);
+pub struct Version(pub u64);
 
 impl Version {
     pub const fn zero() -> Self {
@@ -100,12 +122,12 @@ impl Version {
     }
 
     #[inline]
-    pub const fn v_insert(self) -> u32 {
+    pub const fn v_insert(self) -> u64 {
         (self.0 & V_INSERT_MASK) >> V_INSERT_SHIFT
     }
 
     #[inline]
-    pub const fn v_split(self) -> u32 {
+    pub const fn v_split(self) -> u64 {
         (self.0 & V_SPLIT_MASK) >> V_SPLIT_SHIFT
     }
 
@@ -125,11 +147,13 @@ impl Version {
 /// version CAS doesn't false-share with adjacent nodes' payloads.
 #[repr(C, align(64))]
 pub struct Node {
-    version: AtomicU32,
-    kind: NodeKind,
-    n_keys: u8,
-    _pad: u16,
-    keys: [Key; MAX_KEYS],
+    version: AtomicU64,
+    // Set once in `alloc` before the node is published and never changed
+    // after; atomic so the write is not aliasing UB through `&Node`.
+    kind: AtomicU8,
+    n_keys: AtomicU8,
+    // Keys as big-endian `u64` words so readers can load them atomically.
+    keys: [AtomicU64; MAX_KEYS],
     // Leaves populate `values` with the payload paired with each key.
     values: [AtomicU64; MAX_KEYS],
     // Internal nodes populate `children`; `children[i]` is the
@@ -142,11 +166,13 @@ pub struct Node {
 
 impl Node {
     const EMPTY: Self = Self {
-        version: AtomicU32::new(0),
-        kind: NodeKind::Leaf,
-        n_keys: 0,
-        _pad: 0,
-        keys: [[0u8; 8]; MAX_KEYS],
+        version: AtomicU64::new(0),
+        kind: AtomicU8::new(NodeKind::Leaf as u8),
+        n_keys: AtomicU8::new(0),
+        keys: {
+            const Z: AtomicU64 = AtomicU64::new(0);
+            [Z; MAX_KEYS]
+        },
         values: {
             const Z: AtomicU64 = AtomicU64::new(0);
             [Z; MAX_KEYS]
@@ -173,17 +199,17 @@ impl Node {
     /// word read *before* and *after* this call match and neither
     /// has the inserting / splitting bit set.
     unsafe fn leaf_scan(&self, key: &Key) -> Option<Value> {
-        // `n_keys` is a plain byte; the version word's stability is
-        // what protects the read. Binary search over 15 slots is
-        // cheap enough that linear probe with branch-predictable
-        // compares ties or wins; keep linear here.
-        let n = self.n_keys as usize;
+        // Atomic loads keep this race-free; the version word's stability
+        // is what makes the *set* of loads consistent. Linear probe over
+        // the (small, branch-predictable) key array.
+        let kw = key_word(key);
+        let n = (self.n_keys.load(Ordering::Acquire) as usize).min(MAX_KEYS);
         for i in 0..n {
-            if self.keys[i] == *key {
-                let v = self.values[i].load(Ordering::Acquire);
-                return Some(v);
+            let stored = self.keys[i].load(Ordering::Acquire);
+            if stored == kw {
+                return Some(self.values[i].load(Ordering::Acquire));
             }
-            if self.keys[i] > *key {
+            if stored > kw {
                 return None;
             }
         }
@@ -194,21 +220,114 @@ impl Node {
     /// version-stability contract as `leaf_scan`.
     #[inline]
     unsafe fn internal_descend(&self, key: &Key) -> NodeId {
-        let n = self.n_keys as usize;
+        let kw = key_word(key);
+        let n = (self.n_keys.load(Ordering::Acquire) as usize).min(MAX_KEYS);
         for i in 0..n {
-            if self.keys[i] > *key {
+            if self.keys[i].load(Ordering::Acquire) > kw {
                 return self.children[i].load(Ordering::Acquire);
             }
         }
         self.children[n].load(Ordering::Acquire)
     }
+
+    /// Spin-acquire the writer lock (the version word's LOCKED bit). Only
+    /// one writer holds it at a time; readers observe LOCKED and retry.
+    fn lock(&self) {
+        loop {
+            let v = self.version.load(Ordering::Relaxed);
+            if v & LOCKED == 0
+                && self
+                    .version
+                    .compare_exchange_weak(v, v | LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Release the writer lock and publish the mutation: clear LOCKED and
+    /// INSERTING and bump `v_insert` (wrapping inside its 32-bit field,
+    /// never into `v_split`) in a single release store. This is the
+    /// reader-visible commit point; the release publishes the relaxed key/
+    /// value/n_keys stores made under the lock. The caller holds the lock,
+    /// so the version word is ours.
+    fn unlock_bump_insert(&self) {
+        let v = self.version.load(Ordering::Relaxed);
+        let bumped = (v & V_INSERT_MASK).wrapping_add(1 << V_INSERT_SHIFT) & V_INSERT_MASK;
+        let new = (v & !(LOCKED | INSERTING | V_INSERT_MASK)) | bumped;
+        self.version.store(new, Ordering::Release);
+    }
+
+    /// Insert or replace `key`/`value` in this leaf, keeping keys sorted.
+    ///
+    /// # Safety
+    /// The node's writer lock must be held and the node must be a leaf.
+    /// `unlock_bump_insert` must publish the result afterwards.
+    unsafe fn leaf_insert(&self, key: &Key, value: Value) -> Result<Inserted, InsertError> {
+        let kw = key_word(key);
+        let n = self.n_keys.load(Ordering::Relaxed) as usize;
+        let mut pos = n;
+        for i in 0..n {
+            let stored = self.keys[i].load(Ordering::Relaxed);
+            if stored == kw {
+                self.values[i].store(value, Ordering::Release);
+                return Ok(Inserted::Updated);
+            }
+            if stored > kw {
+                pos = i;
+                break;
+            }
+        }
+        if n >= MAX_KEYS {
+            return Err(InsertError::NodeFull);
+        }
+        // Tell racing readers the key array is being shifted; the unlock
+        // clears this and bumps the version so they re-read. Relaxed stores
+        // are fine — the unlock's release publishes them together.
+        self.version.fetch_or(INSERTING, Ordering::Release);
+        let mut i = n;
+        while i > pos {
+            self.keys[i].store(self.keys[i - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+            self.values[i].store(self.values[i - 1].load(Ordering::Relaxed), Ordering::Relaxed);
+            i -= 1;
+        }
+        self.keys[pos].store(kw, Ordering::Relaxed);
+        self.values[pos].store(value, Ordering::Relaxed);
+        self.n_keys.store((n + 1) as u8, Ordering::Relaxed);
+        Ok(Inserted::New)
+    }
 }
 
-/// Concurrent B+tree. Readers take `&Tree`; writers (to land in a
-/// later commit) also take `&Tree` and rely on per-node locks.
+/// Outcome of a successful [`Tree::insert`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inserted {
+    /// The key was new; a slot was added.
+    New,
+    /// The key already existed; its value was replaced.
+    Updated,
+}
+
+/// Why an [`Tree::insert`] could not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertError {
+    /// The target leaf is full. Node splitting lands in a later commit;
+    /// until then a full leaf cannot take a new key.
+    NodeFull,
+    /// The fixed node pool is exhausted.
+    PoolExhausted,
+}
+
+/// Concurrent B+tree. Readers take `&Tree` and never latch; writers also
+/// take `&Tree` and serialize per node through the version word's lock
+/// bit.
 pub struct Tree {
     pool: [Node; POOL_SIZE],
     root: AtomicU32,
+    /// Bump allocator cursor into `pool`. Deletes retire through EBR and
+    /// (later) recycle; for now allocation only moves forward.
+    alloc_next: AtomicU32,
 }
 
 impl Tree {
@@ -217,12 +336,83 @@ impl Tree {
         Self {
             pool: [EMPTY_NODE; POOL_SIZE],
             root: AtomicU32::new(NULL_NODE),
+            alloc_next: AtomicU32::new(0),
         }
     }
 
     #[inline]
     fn node(&self, id: NodeId) -> &Node {
         &self.pool[id as usize]
+    }
+
+    /// Hand out a fresh node of `kind` from the pool. The returned node is
+    /// zeroed (empty leaf/internal) and not yet linked into the tree, so
+    /// its non-atomic header can be initialized without synchronization.
+    fn alloc(&self, kind: NodeKind) -> Option<NodeId> {
+        let id = self.alloc_next.fetch_add(1, Ordering::AcqRel);
+        if id as usize >= POOL_SIZE {
+            return None;
+        }
+        // This id was just claimed and is not reachable from the root yet,
+        // so no other thread can observe the node until we publish it (CAS
+        // into root or a child slot). `EMPTY` already zeroed the pool.
+        let node = self.node(id);
+        node.kind.store(kind as u8, Ordering::Release);
+        node.n_keys.store(0, Ordering::Release);
+        node.version.store(0, Ordering::Release);
+        Some(id)
+    }
+
+    /// Insert `value` under `key`, replacing any existing value. Serializes
+    /// against other writers on the target leaf and is safe against
+    /// concurrent lock-free readers.
+    pub fn insert(&self, key: Key, value: Value) -> Result<Inserted, InsertError> {
+        let root = self.ensure_root()?;
+        let leaf_id = self.find_leaf(root, &key);
+        let leaf = self.node(leaf_id);
+        leaf.lock();
+        // Safety: we hold the leaf's lock, so no other writer touches it;
+        // readers retry on the lock/version. `unlock_bump_insert` publishes
+        // the change.
+        let result = unsafe { leaf.leaf_insert(&key, value) };
+        leaf.unlock_bump_insert();
+        result
+    }
+
+    /// Return the root leaf id, installing a fresh empty leaf the first
+    /// time.
+    fn ensure_root(&self) -> Result<NodeId, InsertError> {
+        let root = self.root.load(Ordering::Acquire);
+        if root != NULL_NODE {
+            return Ok(root);
+        }
+        let leaf = self.alloc(NodeKind::Leaf).ok_or(InsertError::PoolExhausted)?;
+        match self
+            .root
+            .compare_exchange(NULL_NODE, leaf, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(leaf),
+            // Lost the race; the leaf we allocated simply leaks in the
+            // bump pool. Use whichever root won.
+            Err(existing) => Ok(existing),
+        }
+    }
+
+    /// Walk from `start` to the leaf that must hold `key`. `kind` is
+    /// immutable once a node is allocated (splits create new nodes rather
+    /// than converting), so it can be read without synchronization.
+    fn find_leaf(&self, start: NodeId, key: &Key) -> NodeId {
+        let mut id = start;
+        loop {
+            let node = self.node(id);
+            if NodeKind::from_u8(node.kind.load(Ordering::Acquire)) == NodeKind::Leaf {
+                return id;
+            }
+            // Safety: internal `kind`/`keys`/`children` are stable in the
+            // no-split tree; concurrent-safe descent through splits lands
+            // with the split implementation.
+            id = unsafe { node.internal_descend(key) };
+        }
     }
 
     /// Lock-free lookup. Follows the root → leaf descent, checking
@@ -287,7 +477,7 @@ impl Tree {
     /// # Safety
     /// Caller must bracket this call with matching version loads.
     unsafe fn step(&self, node: &Node, key: &Key) -> Option<NextStep> {
-        match node.kind {
+        match NodeKind::from_u8(node.kind.load(Ordering::Acquire)) {
             NodeKind::Leaf => match unsafe { node.leaf_scan(key) } {
                 Some(v) => Some(NextStep::Found(v)),
                 None => Some(NextStep::Absent),
@@ -338,15 +528,10 @@ impl Tree {
             assert!(w[0].0 < w[1].0);
         }
         let node = &self.pool[0];
-        let node_mut = &self.pool[0] as *const Node as *mut Node;
-        unsafe {
-            (*node_mut).kind = NodeKind::Leaf;
-            (*node_mut).n_keys = entries.len() as u8;
-            for (i, (k, _)) in entries.iter().enumerate() {
-                (*node_mut).keys[i] = *k;
-            }
-        }
-        for (i, (_, v)) in entries.iter().enumerate() {
+        node.kind.store(NodeKind::Leaf as u8, Ordering::Release);
+        node.n_keys.store(entries.len() as u8, Ordering::Release);
+        for (i, (k, v)) in entries.iter().enumerate() {
+            node.keys[i].store(key_word(k), Ordering::Release);
             node.values[i].store(*v, Ordering::Release);
         }
         node.version.store(0, Ordering::Release);
@@ -368,7 +553,7 @@ impl Tree {
         let node = &self.pool[root as usize];
         let mut v = node.version.load(Ordering::Relaxed);
         loop {
-            let new_v = (v & !LOCKED).wrapping_add(1u32 << V_INSERT_SHIFT);
+            let new_v = (v & !LOCKED).wrapping_add(1u64 << V_INSERT_SHIFT);
             match node.version.compare_exchange_weak(
                 v,
                 new_v,
@@ -424,7 +609,7 @@ mod tests {
         assert_eq!(v.v_insert(), 0);
         assert_eq!(v.v_split(), 0);
 
-        let v = Version((7 << V_INSERT_SHIFT) | (11 << V_SPLIT_SHIFT));
+        let v = Version((7u64 << V_INSERT_SHIFT) | (11u64 << V_SPLIT_SHIFT));
         assert_eq!(v.v_insert(), 7);
         assert_eq!(v.v_split(), 11);
         assert!(!v.is_locked());
@@ -456,5 +641,101 @@ mod tests {
 
         let got = reader.join().unwrap();
         assert_eq!(got, Some(777));
+    }
+
+    #[test]
+    fn insert_keeps_keys_sorted_and_readable() {
+        let t = Tree::new();
+        // Insert out of order; lookups must find every key.
+        for x in [5u64, 1, 9, 3, 7, 2, 8, 4, 6] {
+            assert_eq!(t.insert(k(x), x * 100), Ok(Inserted::New));
+        }
+        for x in 1..=9u64 {
+            assert_eq!(t.lookup(&k(x)), Some(x * 100));
+        }
+        assert_eq!(t.lookup(&k(0)), None);
+        assert_eq!(t.lookup(&k(10)), None);
+    }
+
+    #[test]
+    fn insert_replaces_existing_value() {
+        let t = Tree::new();
+        assert_eq!(t.insert(k(4), 400), Ok(Inserted::New));
+        assert_eq!(t.insert(k(4), 4000), Ok(Inserted::Updated));
+        assert_eq!(t.lookup(&k(4)), Some(4000));
+    }
+
+    #[test]
+    fn full_leaf_reports_node_full() {
+        let t = Tree::new();
+        for x in 0..MAX_KEYS as u64 {
+            assert_eq!(t.insert(k(x), x), Ok(Inserted::New));
+        }
+        // One more distinct key has nowhere to go until splitting lands.
+        assert_eq!(t.insert(k(1000), 1), Err(InsertError::NodeFull));
+        // But replacing an existing key still works when full.
+        assert_eq!(t.insert(k(0), 42), Ok(Inserted::Updated));
+        assert_eq!(t.lookup(&k(0)), Some(42));
+    }
+
+    #[test]
+    fn concurrent_writers_disjoint_keys_all_land() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::vec::Vec;
+
+        // 5 writers x 3 disjoint keys = 15 = MAX_KEYS, all into the one leaf.
+        let t = Arc::new(Tree::new());
+        let mut handles = Vec::new();
+        for w in 0..5u64 {
+            let tw = Arc::clone(&t);
+            handles.push(thread::spawn(move || {
+                for j in 0..3u64 {
+                    let key = w * 3 + j;
+                    assert_eq!(tw.insert(k(key), key + 1), Ok(Inserted::New));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        for key in 0..15u64 {
+            assert_eq!(t.lookup(&k(key)), Some(key + 1), "key {key} missing");
+        }
+    }
+
+    #[test]
+    fn concurrent_reader_never_sees_torn_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::thread;
+
+        // A writer fills a leaf while a reader hammers lookups on a moving
+        // set of keys. Every observed value must be the one paired with the
+        // key (or absent) — never a mismatched or garbage value.
+        let t = Arc::new(Tree::new());
+        let done = Arc::new(AtomicBool::new(false));
+
+        let tr = Arc::clone(&t);
+        let dr = Arc::clone(&done);
+        let reader = thread::spawn(move || {
+            while !dr.load(O::Acquire) {
+                for x in 0..MAX_KEYS as u64 {
+                    if let Some(v) = tr.lookup(&k(x)) {
+                        assert_eq!(v, x + 1, "key {x} read a mismatched value {v}");
+                    }
+                }
+            }
+        });
+
+        for x in 0..MAX_KEYS as u64 {
+            assert_eq!(t.insert(k(x), x + 1), Ok(Inserted::New));
+        }
+        done.store(true, O::Release);
+        reader.join().unwrap();
+
+        for x in 0..MAX_KEYS as u64 {
+            assert_eq!(t.lookup(&k(x)), Some(x + 1));
+        }
     }
 }
