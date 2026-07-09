@@ -232,10 +232,24 @@ mod tests {
     #[test]
     fn retire_overflow_returns_error() {
         let ebr = Ebr::new();
-        for i in 0..RETIRE_CAP {
-            unsafe { ebr.retire(0, i as u64).unwrap() };
+        // `retire` buckets by the globally-shared Silo epoch, which other
+        // tests advance concurrently, so a fixed count need not all land in
+        // one bucket. Retire until some bucket fills and returns the datum;
+        // that is the overflow contract. The bound (all three buckets full)
+        // keeps a shifting epoch from looping forever.
+        let mut i = 0u64;
+        loop {
+            match unsafe { ebr.retire(0, i) } {
+                Ok(()) => {
+                    i += 1;
+                    assert!(i <= 3 * RETIRE_CAP as u64, "no bucket ever overflowed");
+                }
+                Err(returned) => {
+                    assert_eq!(returned, i, "overflow must hand the datum back");
+                    break;
+                }
+            }
         }
-        assert_eq!(unsafe { ebr.retire(0, 9999) }, Err(9999));
     }
 
     #[test]
