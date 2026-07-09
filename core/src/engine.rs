@@ -55,6 +55,7 @@
 //! [absent]: Tid::is_absent
 
 use crate::bptree::{BpTree, Key};
+use crate::cbptree::Tree as CbTree;
 use crate::lba_alloc::WAL_START;
 use crate::silo::{
     self, CommitOutcome, MAX_RW_SET, Record, Tid, TxnState, current_epoch, ensure_epoch_at_least,
@@ -70,30 +71,36 @@ use crate::wal::{Op, Wal};
 /// this cap is hit; both limits surface as [`EngineError::OutOfSpace`].
 pub const ENGINE_RECORDS: usize = 512;
 
-/// Ordered key → record-slot map. A thin trait so the engine can move
-/// from the sequential [`BpTree`] to the concurrent index later without
-/// touching the transaction path.
+/// Ordered key → record-slot map. Both methods take `&self`: a
+/// concurrent index (see [`CbTreeIndex`]) resolves lookups lock-free and
+/// serializes writers internally, so the engine keeps no lock on the read
+/// path. The sequential [`BpTreeIndex`] wraps its tree in a lock to honor
+/// the same shape.
 pub trait Index {
     /// Slot currently mapped to `key`, or `None` if unmapped.
     fn get(&self, key: Key) -> Option<u32>;
     /// Map `key` to `slot`. Returns [`IndexFull`] if the index cannot
     /// grow to hold another key.
-    fn insert(&mut self, key: Key, slot: u32) -> Result<(), IndexFull>;
+    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull>;
 }
 
 /// The index cannot accept another key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexFull;
 
-/// [`Index`] backed by the sequential B+tree. The tree's 8-byte value
-/// slot carries the record index as a big-endian `u64`.
+/// [`Index`] backed by the sequential B+tree, serialized behind a lock so
+/// it can present a `&self` writer. The tree's 8-byte value slot carries
+/// the record index as a big-endian `u64`. Correct but fully serial —
+/// [`CbTreeIndex`] is the concurrent path.
 pub struct BpTreeIndex {
-    tree: BpTree,
+    tree: SpinLock<BpTree>,
 }
 
 impl BpTreeIndex {
     pub const fn new() -> Self {
-        Self { tree: BpTree::new() }
+        Self {
+            tree: SpinLock::new(BpTree::new()),
+        }
     }
 }
 
@@ -105,12 +112,46 @@ impl Default for BpTreeIndex {
 
 impl Index for BpTreeIndex {
     fn get(&self, key: Key) -> Option<u32> {
-        self.tree.lookup(key).map(|v| u64::from_be_bytes(v) as u32)
+        self.tree.lock().lookup(key).map(|v| u64::from_be_bytes(v) as u32)
     }
 
-    fn insert(&mut self, key: Key, slot: u32) -> Result<(), IndexFull> {
+    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull> {
         self.tree
+            .lock()
             .upsert(key, (slot as u64).to_be_bytes())
+            .map(|_| ())
+            .map_err(|_| IndexFull)
+    }
+}
+
+/// [`Index`] backed by the lock-free concurrent B+tree. Lookups run
+/// without any engine lock; writers serialize on the tree's internal
+/// writer lock. The 8-byte value slot carries the record index directly
+/// as a `u64`.
+pub struct CbTreeIndex {
+    tree: CbTree,
+}
+
+impl CbTreeIndex {
+    pub const fn new() -> Self {
+        Self { tree: CbTree::new() }
+    }
+}
+
+impl Default for CbTreeIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Index for CbTreeIndex {
+    fn get(&self, key: Key) -> Option<u32> {
+        self.tree.lookup(&key).map(|v| v as u32)
+    }
+
+    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull> {
+        self.tree
+            .insert(key, slot as u64)
             .map(|_| ())
             .map_err(|_| IndexFull)
     }
@@ -127,35 +168,47 @@ pub enum EngineError {
     OutOfSpace,
 }
 
-/// Index + slot allocator, guarded together so find-or-allocate is
-/// atomic across concurrent transactions touching new keys.
-struct Directory<I: Index> {
-    index: I,
-    next_slot: u32,
-}
-
 /// A key-addressable transactional store over Silo OCC.
 pub struct Engine<I: Index = BpTreeIndex> {
     records: [Record; ENGINE_RECORDS],
-    dir: SpinLock<Directory<I>>,
+    /// Key → slot map. Read off the hot path with no engine lock; the
+    /// concurrent index makes lookups lock-free.
+    index: I,
+    /// Next unused record slot. Guarded so the find-or-allocate for a
+    /// brand-new key is atomic across concurrent transactions; existing
+    /// keys never touch this lock (they resolve through `index` alone).
+    next_slot: SpinLock<u32>,
     /// Write-ahead log cursor for durable commits. Guarded so concurrent
     /// durable commits serialize their append + flush.
     wal: SpinLock<Wal>,
 }
 
+/// A fresh slot is `absent`: no key maps to it yet, and a reader that
+/// reaches one (e.g. after an aborted insert left an index entry) sees
+/// `None` rather than a zero value.
+const EMPTY_RECORDS: [Record; ENGINE_RECORDS] =
+    [const { Record::new(Tid::from_raw(Tid::ABSENT), 0) }; ENGINE_RECORDS];
+
 impl Engine<BpTreeIndex> {
-    /// Construct an empty engine. `const` so it can back a `static` on
-    /// bare metal without a runtime initializer.
+    /// Construct an empty engine on the sequential index. `const` so it
+    /// can back a `static` on bare metal without a runtime initializer.
     pub const fn new() -> Self {
         Self {
-            // A fresh slot is `absent`: no key maps to it yet, and a
-            // reader that reaches one (e.g. after an aborted insert
-            // left an index entry) sees `None` rather than a zero value.
-            records: [const { Record::new(Tid::from_raw(Tid::ABSENT), 0) }; ENGINE_RECORDS],
-            dir: SpinLock::new(Directory {
-                index: BpTreeIndex::new(),
-                next_slot: 0,
-            }),
+            records: EMPTY_RECORDS,
+            index: BpTreeIndex::new(),
+            next_slot: SpinLock::new(0),
+            wal: SpinLock::new(Wal::new()),
+        }
+    }
+}
+
+impl Engine<CbTreeIndex> {
+    /// Construct an empty engine on the lock-free concurrent index.
+    pub const fn concurrent() -> Self {
+        Self {
+            records: EMPTY_RECORDS,
+            index: CbTreeIndex::new(),
+            next_slot: SpinLock::new(0),
             wal: SpinLock::new(Wal::new()),
         }
     }
@@ -321,17 +374,26 @@ impl<I: Index> Engine<I> {
     }
 
     /// Slot for `key`, allocating a fresh record if the key is new.
+    ///
+    /// The common case — a key already in the index — resolves lock-free
+    /// through `index.get` with no engine lock held. Only a brand-new key
+    /// takes `next_slot`, and re-checks the index under it (a racing
+    /// allocator may have bound the key between our miss and the lock), so
+    /// a key is never assigned two slots.
     fn slot_for(&self, key: Key) -> Option<u32> {
-        let mut dir = self.dir.lock();
-        if let Some(slot) = dir.index.get(key) {
+        if let Some(slot) = self.index.get(key) {
             return Some(slot);
         }
-        let slot = dir.next_slot;
+        let mut next = self.next_slot.lock();
+        if let Some(slot) = self.index.get(key) {
+            return Some(slot);
+        }
+        let slot = *next;
         if slot as usize >= ENGINE_RECORDS {
             return None;
         }
-        dir.index.insert(key, slot).ok()?;
-        dir.next_slot = slot + 1;
+        self.index.insert(key, slot).ok()?;
+        *next = slot + 1;
         Some(slot)
     }
 
@@ -837,5 +899,86 @@ mod tests {
         let again = Box::new(Engine::new());
         again.recover(&mut storage).unwrap();
         assert_eq!(again.transaction(4, |t| t.get(k(1))).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn concurrent_index_lands_every_disjoint_key() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Drive the lock-free index through the transaction path from several
+        // threads at once. Each thread owns a disjoint key range, so no write
+        // conflicts: every put must commit, and every value must read back —
+        // proving concurrent lookups, first-touch slot allocation, and tree
+        // inserts stay consistent under contention.
+        const THREADS: u64 = 4;
+        const PER: u64 = 64; // THREADS * PER = 256 keys <= ENGINE_RECORDS
+
+        let engine = Arc::new(Engine::concurrent());
+        let mut handles = std::vec::Vec::new();
+        for t in 0..THREADS {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for i in 0..PER {
+                    let key = t * PER + i;
+                    let committed = e.transaction(8, |txn| {
+                        txn.put(k(key), key + 1)?;
+                        Ok(())
+                    });
+                    assert_eq!(committed, Some(()), "disjoint put must commit");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every key from every thread is present with its value.
+        for key in 0..(THREADS * PER) {
+            let got = engine.transaction(8, |txn| txn.get(k(key))).unwrap();
+            assert_eq!(got, Some(key + 1), "key {key} lost or wrong after concurrent load");
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_never_see_a_half_installed_key() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        use std::thread;
+
+        // One writer streams new keys into the concurrent index while readers
+        // hammer the whole committed prefix. A committed key must never read
+        // back absent or with a wrong value mid-restructuring (leaf/internal
+        // splits happen as the tree grows).
+        let engine = Arc::new(Engine::concurrent());
+        let committed = Arc::new(AtomicU64::new(0));
+        let n = 256u64;
+
+        let mut readers = std::vec::Vec::new();
+        for _ in 0..3 {
+            let e = Arc::clone(&engine);
+            let c = Arc::clone(&committed);
+            readers.push(thread::spawn(move || {
+                while c.load(O::Acquire) < n {
+                    let hi = c.load(O::Acquire);
+                    for key in 0..hi {
+                        let got = e.transaction(8, |txn| txn.get(k(key))).unwrap();
+                        assert_eq!(got, Some(key + 1), "committed key {key} vanished");
+                    }
+                }
+            }));
+        }
+
+        for key in 0..n {
+            let ok = engine.transaction(8, |txn| {
+                txn.put(k(key), key + 1)?;
+                Ok(())
+            });
+            assert_eq!(ok, Some(()));
+            committed.store(key + 1, O::Release);
+        }
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 }
