@@ -153,13 +153,14 @@ fn run_engine(nvme: &mut bmdb_nvme::Controller) {
 }
 
 /// End of boot. The unattended hardware-test build self-resets to run the
-/// next PXE image (AMT cannot reset the box while this driverless OS holds
-/// the shared NIC); every other build simply halts.
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench"))))]
+/// next PXE image — for any workload, so a benchmark can be re-run each
+/// cycle (AMT cannot reset the box while this driverless OS holds the
+/// shared NIC); every other build simply halts.
+#[cfg(feature = "hw-loop")]
 fn finish() -> ! {
     delay_then_reset()
 }
-#[cfg(not(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench")))))]
+#[cfg(not(feature = "hw-loop"))]
 fn finish() -> ! {
     hlt_loop()
 }
@@ -197,7 +198,7 @@ fn boot_counter(nvme: &mut bmdb_nvme::Controller) {
 /// machine so the next PXE image runs. Warm reset via the Intel PCH
 /// reset-control register (0xCF9), with the legacy 8042 pulse as a
 /// fallback — either re-enters POST and PXE.
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench"))))]
+#[cfg(feature = "hw-loop")]
 fn delay_then_reset() -> ! {
     use x86_64::instructions::port::Port;
 
