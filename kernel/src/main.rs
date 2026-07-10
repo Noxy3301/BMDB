@@ -26,6 +26,8 @@ mod bench;
 mod engine_bench;
 mod gdt;
 #[cfg(feature = "ycsb-bench")]
+mod pmu;
+#[cfg(feature = "ycsb-bench")]
 mod timing;
 #[cfg(feature = "ycsb-bench")]
 mod ycsb_bench;

@@ -17,13 +17,14 @@
 //! real M920q; on QEMU this validates correctness (no crash, every key still
 //! reads back) and the harness, nothing more.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bmdb_core::masstree::Masstree;
 use bmdb_serial::serial_println;
 
 use crate::acpi::MAX_CPUS;
-use crate::timing;
+use crate::{pmu, timing};
 
 /// Warm tree size: fills the leaf pool so the tree is a few levels deep and
 /// upper splits are rare. The read/update run phase never inserts, so no
@@ -57,6 +58,23 @@ static OPS: [OpSlot; MAX_CPUS] = {
     [E; MAX_CPUS]
 };
 
+/// Per-core, per-workload PMU counter deltas. Single-writer per cpu_index
+/// (its own window), read by the BSP after the final phase barrier -- the
+/// same publication edge as OPS, so an UnsafeCell is safe.
+#[repr(C, align(64))]
+struct CtrSlot {
+    d: UnsafeCell<[pmu::Counters; N_WORKLOADS]>,
+}
+// Safety: only the owning cpu writes its slot, and the BSP reads after the
+// PHASE_DONE barrier -- same invariant as OPS / engine_bench's slots.
+unsafe impl Sync for CtrSlot {}
+static CTRS: [CtrSlot; MAX_CPUS] = {
+    const E: CtrSlot = CtrSlot {
+        d: UnsafeCell::new([pmu::Counters::ZERO; N_WORKLOADS]),
+    };
+    [E; MAX_CPUS]
+};
+
 static LIVE_CPU_MASK: AtomicU64 = AtomicU64::new(0);
 static WORKERS_READY: AtomicU32 = AtomicU32::new(0);
 /// BSP flips `PHASE_GO[p]` to release workload phase `p`; workers bump
@@ -75,9 +93,19 @@ fn xorshift(state: &mut u64) -> u64 {
     x
 }
 
-/// Run one workload for this core's cycle budget; return ops completed.
-fn run_window(cpu: usize, read_pct: u64) -> u64 {
+/// Run one workload for this core's cycle budget; return (ops, PMU delta over
+/// the window). Each core programs and reads its own counters.
+fn run_window(cpu: usize, read_pct: u64) -> (u64, pmu::Counters) {
     let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ ((cpu as u64).wrapping_add(1));
+    let use_pmu = pmu::available();
+    if use_pmu {
+        pmu::program();
+    }
+    let c0 = if use_pmu {
+        pmu::read()
+    } else {
+        pmu::Counters::ZERO
+    };
     let start = timing::start();
     let mut ops = 0u64;
     loop {
@@ -95,7 +123,21 @@ fn run_window(cpu: usize, read_pct: u64) -> u64 {
             break;
         }
     }
-    ops
+    let delta = if use_pmu {
+        pmu::read().delta(&c0)
+    } else {
+        pmu::Counters::ZERO
+    };
+    (ops, delta)
+}
+
+/// Store a worker's per-workload result. Single-writer per cpu.
+fn record(cpu: usize, p: usize, ops: u64, ctr: pmu::Counters) {
+    OPS[cpu].ops[p].store(ops, Ordering::Relaxed);
+    // Safety: single-writer per cpu; published to the BSP via PHASE_DONE.
+    unsafe {
+        (*CTRS[cpu].d.get())[p] = ctr;
+    }
 }
 
 /// Published by the BSP before releasing phase 0 so APs know the barrier size.
@@ -122,8 +164,8 @@ pub fn ap_worker(cpu_index: usize) {
                 core::hint::spin_loop();
             }
         }
-        let ops = run_window(cpu_index, READ_PCT[p]);
-        OPS[cpu_index].ops[p].store(ops, Ordering::Relaxed);
+        let (ops, ctr) = run_window(cpu_index, READ_PCT[p]);
+        record(cpu_index, p, ops, ctr);
         PHASE_DONE[p].fetch_add(1, Ordering::Release);
         // Barrier before the next phase so workloads don't overlap.
         while PHASE_DONE[p].load(Ordering::Acquire) < total {
@@ -179,8 +221,8 @@ pub fn run(_nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
 
     for p in 0..N_WORKLOADS {
         PHASE_GO[p].store(true, Ordering::Release);
-        let ops = run_window(my_cpu, READ_PCT[p]);
-        OPS[my_cpu].ops[p].store(ops, Ordering::Relaxed);
+        let (ops, ctr) = run_window(my_cpu, READ_PCT[p]);
+        record(my_cpu, p, ops, ctr);
         PHASE_DONE[p].fetch_add(1, Ordering::Release);
         while PHASE_DONE[p].load(Ordering::Acquire) < total {
             core::hint::spin_loop();
@@ -192,10 +234,14 @@ pub fn run(_nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     // linear scaling.
     let live = LIVE_CPU_MASK.load(Ordering::Acquire);
     let ncores = (live.count_ones()) as u64;
+    let pmu_on = pmu::available();
     for p in 0..N_WORKLOADS {
         let mut total_ops = 0u64;
         let mut min_core = u64::MAX;
         let mut max_core = 0u64;
+        // Summed PMU deltas over all cores for this workload.
+        let mut sum = pmu::Counters::ZERO;
+        let mut hitm_max_kop = 0u64;
         for i in 0..MAX_CPUS {
             if live & (1u64 << i) == 0 {
                 continue;
@@ -204,6 +250,15 @@ pub fn run(_nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
             total_ops += o;
             min_core = min_core.min(o);
             max_core = max_core.max(o);
+            // Safety: written by cpu i before its PHASE_DONE release, read
+            // here after the final barrier.
+            let d = unsafe { (*CTRS[i].d.get())[p] };
+            for g in 0..4 {
+                sum.gp[g] = sum.gp[g].wrapping_add(d.gp[g]);
+            }
+            sum.inst = sum.inst.wrapping_add(d.inst);
+            sum.core_cycles = sum.core_cycles.wrapping_add(d.core_cycles);
+            hitm_max_kop = hitm_max_kop.max(d.per_kop(0, o));
         }
         let agg = timing::ops_per_sec(total_ops, WINDOW_CYCLES, hz);
         let per_core = timing::ops_per_sec(total_ops / ncores.max(1), WINDOW_CYCLES, hz);
@@ -218,6 +273,24 @@ pub fn run(_nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
             min_core,
             max_core,
         );
+        if pmu_on {
+            // XSNP_HITM/kop is the contention smoking gun: if it rises with
+            // core count while per_core_ops_s falls, a shared written line is
+            // the wall. cpi_x100 is cycles-per-instruction times 100.
+            serial_println!(
+                "YCSB-BENCH {} pmu cpi_x100={} hitm/kop={} (worst_core={}) l3miss/kop={} \
+                 l2miss/kop={} mclears/kop={}",
+                WORKLOAD_NAME[p],
+                sum.cpi_x100(),
+                sum.per_kop(0, total_ops),
+                hitm_max_kop,
+                sum.per_kop(1, total_ops),
+                sum.per_kop(2, total_ops),
+                sum.per_kop(3, total_ops),
+            );
+        }
     }
-    serial_println!("YCSB-BENCH done (flat per_core_ops_s across core counts == linear scaling)");
+    serial_println!(
+        "YCSB-BENCH done (flat per_core_ops_s == linear scaling; rising hitm/kop == coherence wall)"
+    );
 }
