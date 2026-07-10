@@ -110,6 +110,20 @@ impl PerCpuAlloc {
     };
 }
 
+/// A cache-line-isolated atomic. `align(64)` so a read-hot field (the root
+/// id, loaded on every descent) owns its line and is not invalidated by
+/// writes to neighbouring header fields (the central refill cursors). Deref
+/// keeps call sites reading `self.root.load(..)` unchanged.
+#[repr(C, align(64))]
+struct Padded(AtomicU32);
+
+impl core::ops::Deref for Padded {
+    type Target = AtomicU32;
+    fn deref(&self) -> &AtomicU32 {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Inserted {
     New,
@@ -259,7 +273,9 @@ pub struct Masstree {
     leaves: [Node; LEAF_POOL],
     inters: [Node; INTER_POOL],
     /// basic_table root_; NULL until the first put installs the root leaf.
-    root: AtomicU32,
+    /// Loaded on every descent, so isolated on its own cache line -- writes to
+    /// the central refill cursors below must not invalidate it.
+    root: Padded,
     /// Central bump cursors: leaf ids are 0..LEAF_POOL; the inter cursor is
     /// pool-relative (id = LEAF_POOL + cursor). The SHARED path bumps these
     /// directly; per-cpu caches refill a REFILL_STRIDE window from them.
@@ -293,7 +309,7 @@ impl Masstree {
         Masstree {
             leaves: [LEAF_INIT; LEAF_POOL],
             inters: [INTER_INIT; INTER_POOL],
-            root: AtomicU32::new(NULL_ID),
+            root: Padded(AtomicU32::new(NULL_ID)),
             leaf_central: AtomicU32::new(0),
             inter_central: AtomicU32::new(0),
             caches: [CACHE_INIT; MAX_CPUS + 1],
