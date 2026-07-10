@@ -16,6 +16,8 @@ kbench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "bench"]
 ksilobench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "silo-bench"]
 # Concurrent transactions through the lock-free B+tree index under QEMU.
 kenginebench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "engine-bench"]
+# YCSB A/B/C scaling of the index on a warm tree (QEMU = correctness only).
+kycsbbench = ["run", "-p", "hw-runner", "--", "qemu", "--features", "ycsb-bench"]
 
 # Host-side unit tests for the pure-logic `core` crate.
 ctest = ["test", "--target", "x86_64-unknown-linux-gnu", "-p", "bmdb-core"]

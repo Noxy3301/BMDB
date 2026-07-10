@@ -109,10 +109,10 @@ static ONLINE_APS: AtomicU32 = AtomicU32::new(0);
 /// lost update — which should be impossible given `fetch_add` is
 /// atomic — so the test doubles as a quick regression gate for the
 /// AP bring-up path touching memory correctly.
-#[cfg(not(any(feature = "silo-bench", feature = "engine-bench")))]
+#[cfg(not(any(feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench")))]
 pub(crate) static CONTENTION_COUNTER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-#[cfg(not(any(feature = "silo-bench", feature = "engine-bench")))]
+#[cfg(not(any(feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench")))]
 pub(crate) const CONTENTION_ITERS: u64 = 10_000;
 
 // -- Timing ------------------------------------------------------------
@@ -515,7 +515,7 @@ pub extern "C" fn ap_main(cpu_index: u64) -> ! {
     // fire early — otherwise `smp::init`'s serial wake-up would wait
     // for each AP's full commit loop before starting the next one and
     // the bench would degenerate into a sequence of single-CPU runs.
-    #[cfg(not(any(feature = "silo-bench", feature = "engine-bench")))]
+    #[cfg(not(any(feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench")))]
     {
         for _ in 0..CONTENTION_ITERS {
             CONTENTION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -534,6 +534,11 @@ pub extern "C" fn ap_main(cpu_index: u64) -> ! {
     {
         ONLINE_APS.fetch_add(1, Ordering::Release);
         crate::engine_bench::ap_worker(cpu_index as usize);
+    }
+    #[cfg(feature = "ycsb-bench")]
+    {
+        ONLINE_APS.fetch_add(1, Ordering::Release);
+        crate::ycsb_bench::ap_worker(cpu_index as usize);
     }
     // Park the AP. Interrupts are masked from the trampoline's `cli`,
     // so `hlt` parks the core indefinitely.
@@ -703,7 +708,7 @@ pub unsafe fn init(phys_mem_offset: u64, regions: &[MemoryRegion]) {
     // invariant — lost updates would collapse the sum. `silo-bench`
     // replaces the contention loop with Silo transactions, so this
     // sum is not meaningful there.
-    #[cfg(not(any(feature = "silo-bench", feature = "engine-bench")))]
+    #[cfg(not(any(feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench")))]
     {
         let expected = total as u64 * CONTENTION_ITERS;
         let got = CONTENTION_COUNTER.load(Ordering::Acquire);
@@ -725,7 +730,7 @@ pub unsafe fn init(phys_mem_offset: u64, regions: &[MemoryRegion]) {
 /// completed their bench workload on `--features silo-bench` /
 /// `--features engine-bench`). The BSP reads this to size its
 /// aggregation loop.
-#[cfg(any(feature = "silo-bench", feature = "engine-bench"))]
+#[cfg(any(feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench"))]
 pub fn online_aps() -> u32 {
     ONLINE_APS.load(Ordering::Acquire)
 }

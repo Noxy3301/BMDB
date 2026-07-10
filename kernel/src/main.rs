@@ -11,9 +11,12 @@
 #[cfg(any(
     all(feature = "bench", feature = "silo-bench"),
     all(feature = "bench", feature = "engine-bench"),
+    all(feature = "bench", feature = "ycsb-bench"),
     all(feature = "silo-bench", feature = "engine-bench"),
+    all(feature = "silo-bench", feature = "ycsb-bench"),
+    all(feature = "engine-bench", feature = "ycsb-bench"),
 ))]
-compile_error!("features `bench`, `silo-bench`, and `engine-bench` are mutually exclusive");
+compile_error!("the bench features (bench/silo-bench/engine-bench/ycsb-bench) are mutually exclusive");
 
 mod acpi;
 mod apic;
@@ -22,6 +25,10 @@ mod bench;
 #[cfg(feature = "engine-bench")]
 mod engine_bench;
 mod gdt;
+#[cfg(feature = "ycsb-bench")]
+mod timing;
+#[cfg(feature = "ycsb-bench")]
+mod ycsb_bench;
 mod interrupts;
 mod memory;
 mod percpu;
@@ -145,7 +152,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     silo_bench::run(&mut nvme, smp::online_aps());
     #[cfg(feature = "engine-bench")]
     engine_bench::run(&mut nvme, smp::online_aps());
-    #[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench")))]
+    #[cfg(feature = "ycsb-bench")]
+    ycsb_bench::run(&mut nvme, smp::online_aps());
+    #[cfg(not(any(
+        feature = "bench",
+        feature = "silo-bench",
+        feature = "engine-bench",
+        feature = "ycsb-bench"
+    )))]
     run_engine(&mut nvme);
 
     serial_println!("It did not crash!");
@@ -156,7 +170,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// feature it is bracketed by unattended real-hardware diagnostics — a
 /// boot counter and raw-block / WAL durability probes — that report over
 /// the video console during a self-resetting PXE test cycle.
-#[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench")))]
+#[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench")))]
 fn run_engine(nvme: &mut bmdb_nvme::Controller) {
     #[cfg(feature = "hw-loop")]
     boot_counter(nvme);
@@ -185,7 +199,7 @@ fn finish() -> ! {
 /// the self-reset cycle even while the WAL path is under repair. A rising
 /// number across screenshots means the box is still cycling; a stuck
 /// number means a boot wedged before this point.
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench"))))]
+#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench"))))]
 fn boot_counter(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::lba_alloc::{BLOCK_SIZE, DATA_START};
 
@@ -241,7 +255,7 @@ fn delay_then_reset() -> ! {
 /// being dropped by the drive even though writes to the data region land
 /// — a region/LBA problem, not the write path. Also prints a build tag so
 /// the running image is unambiguous across the reboot loop.
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench"))))]
+#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench"))))]
 fn wal_readback(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::lba_alloc::{BLOCK_SIZE, WAL_START};
 
@@ -271,7 +285,7 @@ fn wal_readback(nvme: &mut bmdb_nvme::Controller) {
 /// back (proving the in-boot write/read path itself). On real hardware
 /// this separates "the write never reaches media" from "recovery logic
 /// drops it".
-#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench"))))]
+#[cfg(all(feature = "hw-loop", not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench"))))]
 fn nvme_selftest(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::lba_alloc::{BLOCK_SIZE, DATA_START};
 
@@ -342,7 +356,7 @@ fn nvme_selftest(nvme: &mut bmdb_nvme::Controller) {
 /// Runs on every boot; the recovered count grows by one per run, proving
 /// transactional durability across `timeout` / kill / restart cycles.
 /// Also exercises a durable multi-key transaction with a delete.
-#[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench")))]
+#[cfg(not(any(feature = "bench", feature = "silo-bench", feature = "engine-bench", feature = "ycsb-bench")))]
 fn engine_durable_gate(nvme: &mut bmdb_nvme::Controller) {
     use bmdb_core::engine::Engine;
 
