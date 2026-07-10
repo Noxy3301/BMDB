@@ -18,6 +18,7 @@ pub mod engine;
 pub mod kpermuter;
 pub mod kv;
 pub mod lba_alloc;
+pub mod masstree;
 pub mod nodeversion;
 pub mod silo;
 pub mod storage;
