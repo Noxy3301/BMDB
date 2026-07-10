@@ -1771,4 +1771,126 @@ mod tests {
             "(cbptree serializes writers on one lock; masstree locks per node)\n"
         );
     }
+
+    /// YCSB A/B/C scaling on a warm, steady-state tree -- the honest
+    /// measurement the top-down study prescribes (.note/topdown-scaling-
+    /// verdict.md). Unlike the insert microbench (which times the slowest
+    /// wakeup building a tiny tree from empty), this LOADS a tree once, then
+    /// times a fixed DEADLINE WINDOW during which every pinned worker runs
+    /// get/update ops (no allocation -- run phase never inserts), so throughput
+    /// is Σ ops / identical window and stragglers can't set the number.
+    ///
+    ///   YCSB-C: 100% read   YCSB-B: 95% read / 5% update   YCSB-A: 50/50
+    ///
+    /// Run: cargo test -p bmdb-core --release masstree::tests::ycsb
+    ///      -- --ignored --nocapture
+    #[test]
+    #[ignore = "microbench; run explicitly with --ignored --nocapture"]
+    fn ycsb_scaling_on_a_warm_tree() {
+        use std::sync::atomic::{AtomicBool, AtomicU64 as A64, AtomicUsize, Ordering as SO};
+        use std::time::{Duration, Instant};
+
+        // Steady-state tree size: as large as the leaf pool holds so upper
+        // splits are rare and the tree is >~3 levels. Read-only run phase, so
+        // no allocation happens after load.
+        const KEYS: u64 = 6000;
+        const WINDOW: Duration = Duration::from_millis(150);
+        let thread_counts = [1usize, 2, 4, 6];
+
+        fn pin(cpu: usize) {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let mut set: libc::cpu_set_t = core::mem::zeroed();
+                libc::CPU_SET(cpu, &mut set);
+                libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
+        }
+
+        let tree = tree();
+        for key in 0..KEYS {
+            tree.put(k(key), key + 1).expect("load must fit the pool");
+        }
+        // Confirm the warm tree is correct before measuring.
+        for key in [0u64, KEYS / 2, KEYS - 1] {
+            assert_eq!(tree.get(k(key)), Some(key + 1));
+        }
+
+        std::eprintln!(
+            "\nYCSB on a warm {}-key tree, {}ms window, pinned to socket-0 cores:",
+            KEYS,
+            WINDOW.as_millis()
+        );
+        std::eprintln!(
+            "{:>9} | {:>7} | {:>14} {:>8} {:>12}",
+            "workload", "threads", "ops/s", "scaling", "ops/s/core"
+        );
+
+        for &(name, read_pct) in &[("C(100r)", 100u64), ("B(95/5)", 95), ("A(50/50)", 50)] {
+            let mut base = 0.0f64;
+            for &n in &thread_counts {
+                let ready = std::sync::Arc::new(AtomicUsize::new(0));
+                let go = std::sync::Arc::new(AtomicBool::new(false));
+                let total = std::sync::Arc::new(A64::new(0));
+                std::thread::scope(|s| {
+                    for t in 0..n {
+                        let (rd, gg, tot) = (ready.clone(), go.clone(), total.clone());
+                        s.spawn(move || {
+                            pin(t);
+                            // Distinct nonzero xorshift seed per worker.
+                            let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (t as u64 + 1);
+                            let mut xorshift = || {
+                                rng ^= rng << 13;
+                                rng ^= rng >> 7;
+                                rng ^= rng << 17;
+                                rng
+                            };
+                            rd.fetch_add(1, SO::Release);
+                            while !gg.load(SO::Acquire) {
+                                core::hint::spin_loop();
+                            }
+                            let deadline = Instant::now() + WINDOW;
+                            let mut ops = 0u64;
+                            // Check the clock every 256 ops to keep it off the
+                            // hot path.
+                            loop {
+                                for _ in 0..256 {
+                                    let key = xorshift() % KEYS;
+                                    if xorshift() % 100 < read_pct {
+                                        let _ = tree.get(k(key));
+                                    } else {
+                                        let _ = tree.put_on(t, k(key), key + 1);
+                                    }
+                                    ops += 1;
+                                }
+                                if Instant::now() >= deadline {
+                                    break;
+                                }
+                            }
+                            tot.fetch_add(ops, SO::Relaxed);
+                        });
+                    }
+                    while ready.load(SO::Acquire) < n {
+                        core::hint::spin_loop();
+                    }
+                    go.store(true, SO::Release);
+                });
+                let ops = total.load(SO::Relaxed);
+                let rate = ops as f64 / WINDOW.as_secs_f64();
+                if n == 1 {
+                    base = rate;
+                }
+                std::eprintln!(
+                    "{:>9} | {:>7} | {:>14.0} {:>7.2}x {:>12.0}",
+                    name,
+                    n,
+                    rate,
+                    rate / base,
+                    rate / n as f64
+                );
+            }
+        }
+        std::eprintln!(
+            "(flat ops/s/core == linear scaling; steady-state read+update, no alloc)\n"
+        );
+    }
 }
