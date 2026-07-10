@@ -47,6 +47,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::ebr::MAX_CPUS;
 use crate::kpermuter::{Permuter, WIDTH};
 use crate::nodeversion::{NodeVersion, Version, VSPLIT_LOWBIT};
 
@@ -72,6 +73,42 @@ const IWIDTH: i32 = WIDTH;
 /// matters: an internode split truncates the parent before the new sibling
 /// is reachable, so there is no consistent way to abandon it halfway.
 const CASCADE_MAX: usize = 8;
+
+/// Sentinel cpu for callers with no dedicated core (the engine/index path and
+/// single-threaded tests). Allocation then goes straight to the central
+/// atomic cursor -- correct under concurrency, just without the per-cpu fast
+/// path. A real cpu index (0..MAX_CPUS) must be UNIQUE to the calling thread
+/// for the duration, exactly the contract of ebr::enter(cpu).
+const SHARED_CPU: usize = MAX_CPUS;
+
+/// Pool slots a per-cpu cache grabs from the central cursor per refill; the
+/// one shared atomic touch is amortized over this many allocations.
+const REFILL_STRIDE: u32 = 16;
+
+/// Per-cpu allocation cache: private bump ranges carved from the central
+/// cursors plus a private LIFO of returned (never-published) internodes.
+/// Single-writer (the owning cpu), so every field is a plain Relaxed
+/// load/store -- no CAS on the hot insert/split path. align(64) so two cpus'
+/// caches never share a cache line.
+#[repr(C, align(64))]
+struct PerCpuAlloc {
+    leaf_cur: AtomicU32,
+    leaf_end: AtomicU32,
+    inter_cur: AtomicU32,
+    inter_end: AtomicU32,
+    /// LIFO head of returned internodes, linked through node.parent.
+    inter_free: AtomicU32,
+}
+
+impl PerCpuAlloc {
+    const EMPTY: Self = Self {
+        leaf_cur: AtomicU32::new(0),
+        leaf_end: AtomicU32::new(0),
+        inter_cur: AtomicU32::new(0),
+        inter_end: AtomicU32::new(0),
+        inter_free: AtomicU32::new(NULL_ID),
+    };
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Inserted {
@@ -223,29 +260,45 @@ pub struct Masstree {
     inters: [Node; INTER_POOL],
     /// basic_table root_; NULL until the first put installs the root leaf.
     root: AtomicU32,
-    /// Bump cursors; freed published nodes never return (reclamation is
-    /// deferred -- no RCU/EBR yet -- so the pools only grow).
-    leaf_next: AtomicU32,
-    inter_next: AtomicU32,
-    /// LIFO free list of never-published internodes (unused cascade
-    /// reserves), linked through their parent fields; guarded by flock.
-    /// Safe without reclamation because no reader has ever seen them.
-    ifree: AtomicU32,
-    flock: AtomicU32,
+    /// Central bump cursors: leaf ids are 0..LEAF_POOL; the inter cursor is
+    /// pool-relative (id = LEAF_POOL + cursor). The SHARED path bumps these
+    /// directly; per-cpu caches refill a REFILL_STRIDE window from them.
+    /// fetch_add only -- no lock. Pools only grow (reclamation is a later,
+    /// EBR-backed step).
+    leaf_central: AtomicU32,
+    inter_central: AtomicU32,
+    /// Allocation caches. Slots 0..MAX_CPUS are per-cpu, touched only by the
+    /// owning cpu, so disjoint-key writers never contend on an alloc line.
+    /// The extra slot at index MAX_CPUS (== SHARED_CPU) serves callers with no
+    /// dedicated core; it uses the same cache/free-list logic but under
+    /// `shared_lock`, so it too recycles reserves (no leak) -- just not
+    /// lock-free. Each slot's align(64) keeps it off the header line above.
+    caches: [PerCpuAlloc; MAX_CPUS + 1],
+    /// Serializes access to the shared (index MAX_CPUS) cache only; per-cpu
+    /// slots never take it. Off the per-cpu hot path.
+    shared_lock: AtomicU32,
+    /// Startup-only lock serializing the one-time root-leaf install so
+    /// concurrent first-put contenders allocate exactly one root between them
+    /// (no loser-leaf leak). Distinct from `shared_lock` so ensure_root, which
+    /// holds this while calling alloc_leaf (which may take shared_lock), never
+    /// self-deadlocks. NOT on the allocation hot path.
+    init_lock: AtomicU32,
 }
 
 impl Masstree {
     pub const fn new() -> Self {
         const LEAF_INIT: Node = Node::new_const(true);
         const INTER_INIT: Node = Node::new_const(false);
+        const CACHE_INIT: PerCpuAlloc = PerCpuAlloc::EMPTY;
         Masstree {
             leaves: [LEAF_INIT; LEAF_POOL],
             inters: [INTER_INIT; INTER_POOL],
             root: AtomicU32::new(NULL_ID),
-            leaf_next: AtomicU32::new(0),
-            inter_next: AtomicU32::new(0),
-            ifree: AtomicU32::new(NULL_ID),
-            flock: AtomicU32::new(0),
+            leaf_central: AtomicU32::new(0),
+            inter_central: AtomicU32::new(0),
+            caches: [CACHE_INIT; MAX_CPUS + 1],
+            shared_lock: AtomicU32::new(0),
+            init_lock: AtomicU32::new(0),
         }
     }
 
@@ -268,34 +321,23 @@ impl Default for Masstree {
 impl Masstree {
 
     // ---- allocation ----------------------------------------------------
+    //
+    // A central atomic bump cursor is the source of truth; each cpu caches a
+    // REFILL_STRIDE window of it and hands out slots with plain relaxed stores
+    // (single-writer per cpu). Only a cache refill, a SHARED-path caller, or a
+    // per-cpu internode free-list miss touches a shared line, so disjoint-key
+    // inserts on different cpus don't contend on allocation. `cpu` must be
+    // unique to the calling thread (or SHARED_CPU) -- see SHARED_CPU.
 
-    fn alloc_leaf(&self) -> Option<NodeId> {
-        let mut cur = self.leaf_next.load(Ordering::Relaxed);
-        loop {
-            if cur as usize >= LEAF_POOL {
-                return None;
-            }
-            match self.leaf_next.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => cur = c,
-            }
-        }
-        // The permutation word was const-initialized to 0, not a valid
-        // permuter; fix it before anyone can see the node.
-        self.leaves[cur as usize]
-            .permutation
-            .store(Permuter::make_empty(), Ordering::Relaxed);
-        Some(cur)
+    /// True for the shared cache slot (index MAX_CPUS): its ops run under
+    /// `shared_lock`; per-cpu slots are lock-free.
+    fn is_shared(cpu: usize) -> bool {
+        cpu >= MAX_CPUS
     }
 
-    fn flock_acquire(&self) {
+    fn shared_lock_acquire(&self) {
         while self
-            .flock
+            .shared_lock
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
@@ -303,60 +345,128 @@ impl Masstree {
         }
     }
 
-    fn flock_release(&self) {
-        self.flock.store(0, Ordering::Release);
+    fn shared_lock_release(&self) {
+        self.shared_lock.store(0, Ordering::Release);
     }
 
-    fn alloc_inter(&self) -> Option<NodeId> {
-        self.flock_acquire();
-        let head = self.ifree.load(Ordering::Relaxed);
-        if head != NULL_ID {
-            let next = self.node(head).parent.load(Ordering::Relaxed);
-            self.ifree.store(next, Ordering::Relaxed);
-            self.flock_release();
-            // Free-listed nodes are pristine except the repurposed link.
-            self.node(head).parent.store(NULL_ID, Ordering::Relaxed);
-            return Some(head);
-        }
-        self.flock_release();
-        let mut cur = self.inter_next.load(Ordering::Relaxed);
+    /// Claim a refill window `[base, end)` from a central bump `cursor`,
+    /// saturating at `pool`. Uses a CAS loop rather than `fetch_add` so the
+    /// cursor NEVER advances past `pool`: a plain `fetch_add` would keep
+    /// climbing on every post-exhaustion attempt and, after ~2^32 of them,
+    /// wrap to 0 and reissue already-published ids. Returns None once the
+    /// pool is exhausted.
+    fn claim_window(cursor: &AtomicU32, pool: u32) -> Option<(u32, u32)> {
+        let mut base = cursor.load(Ordering::Relaxed);
         loop {
-            if cur as usize >= INTER_POOL {
+            if base >= pool {
                 return None;
             }
-            match self.inter_next.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(LEAF_POOL as NodeId + cur),
-                Err(c) => cur = c,
+            let end = core::cmp::min(base + REFILL_STRIDE, pool);
+            match cursor.compare_exchange_weak(base, end, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some((base, end)),
+                Err(cur) => base = cur,
             }
         }
     }
 
-    fn free_inter(&self, id: NodeId) {
-        self.flock_acquire();
-        let head = self.ifree.load(Ordering::Relaxed);
-        self.node(id).parent.store(head, Ordering::Relaxed);
-        self.ifree.store(id, Ordering::Relaxed);
-        self.flock_release();
+    fn alloc_leaf(&self, cpu: usize) -> Option<NodeId> {
+        let shared = Self::is_shared(cpu);
+        if shared {
+            self.shared_lock_acquire();
+        }
+        let cache = &self.caches[if shared { MAX_CPUS } else { cpu }];
+        let mut cur = cache.leaf_cur.load(Ordering::Relaxed);
+        let id = if cur < cache.leaf_end.load(Ordering::Relaxed) {
+            cache.leaf_cur.store(cur + 1, Ordering::Relaxed);
+            Some(cur)
+        } else {
+            // Window exhausted: grab a fresh stride from the central cursor.
+            match Self::claim_window(&self.leaf_central, LEAF_POOL as u32) {
+                None => None,
+                Some((base, end)) => {
+                    cur = base;
+                    cache.leaf_cur.store(cur + 1, Ordering::Relaxed);
+                    cache.leaf_end.store(end, Ordering::Relaxed);
+                    Some(cur)
+                }
+            }
+        };
+        if shared {
+            self.shared_lock_release();
+        }
+        let id = id?;
+        // The permutation word was const-initialized to 0, not a valid
+        // permuter; fix it before anyone can see the node.
+        self.leaves[id as usize]
+            .permutation
+            .store(Permuter::make_empty(), Ordering::Relaxed);
+        Some(id)
     }
 
-    fn reserve_internodes(&self) -> Option<Reserve> {
+    fn alloc_inter(&self, cpu: usize) -> Option<NodeId> {
+        let shared = Self::is_shared(cpu);
+        if shared {
+            self.shared_lock_acquire();
+        }
+        let cache = &self.caches[if shared { MAX_CPUS } else { cpu }];
+        // Prefer a returned reserve from this slot's free list.
+        let head = cache.inter_free.load(Ordering::Relaxed);
+        let id = if head != NULL_ID {
+            let next = self.node(head).parent.load(Ordering::Relaxed);
+            cache.inter_free.store(next, Ordering::Relaxed);
+            // Free-listed nodes are pristine except the repurposed link.
+            self.node(head).parent.store(NULL_ID, Ordering::Relaxed);
+            Some(head)
+        } else {
+            let mut cur = cache.inter_cur.load(Ordering::Relaxed);
+            if cur < cache.inter_end.load(Ordering::Relaxed) {
+                cache.inter_cur.store(cur + 1, Ordering::Relaxed);
+                Some(LEAF_POOL as NodeId + cur)
+            } else {
+                match Self::claim_window(&self.inter_central, INTER_POOL as u32) {
+                    None => None,
+                    Some((base, end)) => {
+                        cur = base;
+                        cache.inter_cur.store(cur + 1, Ordering::Relaxed);
+                        cache.inter_end.store(end, Ordering::Relaxed);
+                        Some(LEAF_POOL as NodeId + cur)
+                    }
+                }
+            }
+        };
+        if shared {
+            self.shared_lock_release();
+        }
+        id
+    }
+
+    fn free_inter(&self, cpu: usize, id: NodeId) {
+        let shared = Self::is_shared(cpu);
+        if shared {
+            self.shared_lock_acquire();
+        }
+        let cache = &self.caches[if shared { MAX_CPUS } else { cpu }];
+        let head = cache.inter_free.load(Ordering::Relaxed);
+        self.node(id).parent.store(head, Ordering::Relaxed);
+        cache.inter_free.store(id, Ordering::Relaxed);
+        if shared {
+            self.shared_lock_release();
+        }
+    }
+
+    fn reserve_internodes(&self, cpu: usize) -> Option<Reserve> {
         let mut r = Reserve {
             ids: [NULL_ID; CASCADE_MAX],
             n: 0,
         };
         while r.n < CASCADE_MAX {
-            match self.alloc_inter() {
+            match self.alloc_inter(cpu) {
                 Some(id) => {
                     r.ids[r.n] = id;
                     r.n += 1;
                 }
                 None => {
-                    self.return_reserve(r);
+                    self.return_reserve(cpu, r);
                     return None;
                 }
             }
@@ -364,10 +474,24 @@ impl Masstree {
         Some(r)
     }
 
-    fn return_reserve(&self, r: Reserve) {
+    fn return_reserve(&self, cpu: usize, r: Reserve) {
         for i in 0..r.n {
-            self.free_inter(r.ids[i]);
+            self.free_inter(cpu, r.ids[i]);
         }
+    }
+
+    fn init_lock_acquire(&self) {
+        while self
+            .init_lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn init_lock_release(&self) {
+        self.init_lock.store(0, Ordering::Release);
     }
 
     // ---- root management -------------------------------------------------
@@ -377,23 +501,24 @@ impl Masstree {
     /// leaf between them: an un-serialized CAS race would leak every loser's
     /// leaf into the bump pool (reclamation is deferred), and enough startup
     /// contenders could falsely exhaust the fixed leaf pool.
-    fn ensure_root(&self) -> Result<NodeId, InsertError> {
+    fn ensure_root(&self, cpu: usize) -> Result<NodeId, InsertError> {
         let r = self.root.load(Ordering::Acquire);
         if r != NULL_ID {
             return Ok(r);
         }
-        // Double-checked: take the structural lock, re-read, and only the
-        // first thread here allocates + installs the root leaf.
-        self.flock_acquire();
+        // Double-checked under the startup-only init lock, so only the first
+        // thread allocates + installs the root leaf (no loser-leaf leak). The
+        // init lock is off the allocation hot path.
+        self.init_lock_acquire();
         let r = self.root.load(Ordering::Acquire);
         if r != NULL_ID {
-            self.flock_release();
+            self.init_lock_release();
             return Ok(r);
         }
-        let id = match self.alloc_leaf() {
+        let id = match self.alloc_leaf(cpu) {
             Some(id) => id,
             None => {
-                self.flock_release();
+                self.init_lock_release();
                 return Err(InsertError::PoolExhausted);
             }
         };
@@ -401,7 +526,7 @@ impl Masstree {
         // reference zeroes it "to avoid undefined behavior"), parent NULL.
         self.node(id).version.mark_root();
         self.root.store(id, Ordering::Release);
-        self.flock_release();
+        self.init_lock_release();
         Ok(id)
     }
 
@@ -643,13 +768,23 @@ impl Masstree {
         node.publish_perm(perm);
     }
 
-    /// basic_table::put == find_insert + finish. Value updates on an
+    /// basic_table::put with no dedicated cpu: allocates from the shared
+    /// central cursor. Correct under concurrency, just without the per-cpu
+    /// allocation fast path -- use [`put_on`](Self::put_on) with a unique cpu
+    /// index to get that.
+    pub fn put(&self, key: [u8; 8], value: u64) -> Result<Inserted, InsertError> {
+        self.put_on(SHARED_CPU, key, value)
+    }
+
+    /// basic_table::put == find_insert + finish, allocating any new node from
+    /// `cpu`'s private pool. `cpu` must be unique to the calling thread for
+    /// the duration (or `SHARED_CPU`); see [`SHARED_CPU`]. Value updates on an
     /// existing key are a single atomic store into the slot (the reference
     /// hands the value cell to its caller; row-level concurrency control is
     /// out of tree scope there and here).
-    pub fn put(&self, key: [u8; 8], value: u64) -> Result<Inserted, InsertError> {
+    pub fn put_on(&self, cpu: usize, key: [u8; 8], value: u64) -> Result<Inserted, InsertError> {
         let ika = u64::from_be_bytes(key);
-        let root = self.fix_root(self.ensure_root()?);
+        let root = self.fix_root(self.ensure_root(cpu)?);
         let (n, kx) = self.find_locked(root, ika);
         let node = self.node(n);
 
@@ -684,7 +819,7 @@ impl Masstree {
             }
         }
 
-        self.make_split(n, kx.i, ika, value)?;
+        self.make_split(cpu, n, kx.i, ika, value)?;
         Ok(Inserted::New)
     }
 
@@ -847,7 +982,14 @@ impl Masstree {
     /// insertable in place. First retries the free-slot rearrangement, then
     /// runs the full split + hand-over-hand parent cascade. Owns every
     /// unlock on every path.
-    fn make_split(&self, n_orig: NodeId, kxi_in: i32, ika: u64, value: u64) -> Result<(), InsertError> {
+    fn make_split(
+        &self,
+        cpu: usize,
+        n_orig: NodeId,
+        kxi_in: i32,
+        ika: u64,
+        value: u64,
+    ) -> Result<(), InsertError> {
         let nl = self.node(n_orig);
         // Maybe rearrange the permuter so back() is a usable slot: the swap
         // touches only free positions, invisible to readers.
@@ -867,17 +1009,17 @@ impl Masstree {
         // Reserve the cascade's worst-case internodes up front: once an
         // internode splits there is no consistent way to stop, so all
         // allocation failures must surface before the first mutation.
-        let mut reserve = match self.reserve_internodes() {
+        let mut reserve = match self.reserve_internodes(cpu) {
             Some(r) => r,
             None => {
                 nl.version.unlock();
                 return Err(InsertError::PoolExhausted);
             }
         };
-        let child0 = match self.alloc_leaf() {
+        let child0 = match self.alloc_leaf(cpu) {
             Some(id) => id,
             None => {
-                self.return_reserve(reserve);
+                self.return_reserve(cpu, reserve);
                 nl.version.unlock();
                 return Err(InsertError::PoolExhausted);
             }
@@ -931,7 +1073,7 @@ impl Masstree {
                         self.node(child).version.unlock();
                     }
                     self.node(n_cursor).version.unlock();
-                    self.return_reserve(reserve);
+                    self.return_reserve(cpu, reserve);
                     return Err(InsertError::PoolExhausted);
                 }
                 let nn = self.node(nn_id);
@@ -964,7 +1106,7 @@ impl Masstree {
                         }
                         self.node(n_cursor).version.unlock();
                         self.node(p).version.unlock();
-                        self.return_reserve(reserve);
+                        self.return_reserve(cpu, reserve);
                         return Err(InsertError::PoolExhausted);
                     }
                     // assign_version(*p) + mark_nonroot stand-in: fresh
@@ -1052,7 +1194,7 @@ impl Masstree {
         // tcursor::finish: expose the new key and release the cursor leaf.
         self.finish_insert(n_cursor, kxi, kxp);
         self.node(n_cursor).version.unlock();
-        self.return_reserve(reserve);
+        self.return_reserve(cpu, reserve);
         Ok(())
     }
 
@@ -1429,6 +1571,63 @@ mod tests {
         });
     }
 
+    #[test]
+    fn per_cpu_pools_concurrent_disjoint_inserts_all_land() {
+        // Exercises the per-cpu allocation fast path (put_on with a UNIQUE cpu
+        // per thread) directly: each worker allocates from its own pool with
+        // no global lock, splitting its own subtrees. Every key must survive,
+        // and concurrent readers must never lose a committed key -- the same
+        // invariants as the SHARED path, but over the lock-free allocator.
+        let t = tree();
+        let threads = 6usize;
+        let per = 120u64;
+        let committed: &'static [StdAtomicU64] = Box::leak(
+            (0..threads)
+                .map(|_| StdAtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        thread::scope(|s| {
+            for c in 0..threads {
+                s.spawn(move || {
+                    let base = c as u64 * per;
+                    for i in 0..per {
+                        let key = base + i;
+                        assert_eq!(t.put_on(c, k(key), key + 1), Ok(Inserted::New));
+                        committed[c].store(i + 1, O::Release);
+                    }
+                });
+            }
+            // A reader hammering every committed key of every worker: none may
+            // vanish or read a foreign value while the per-cpu writers split.
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let mut done = false;
+                    while !done {
+                        done = true;
+                        for (c, prog) in committed.iter().enumerate() {
+                            let hi = prog.load(O::Acquire);
+                            if hi < per {
+                                done = false;
+                            }
+                            let base = c as u64 * per;
+                            for i in 0..hi {
+                                let key = base + i;
+                                assert_eq!(t.get(k(key)), Some(key + 1), "committed key {key} vanished");
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        for c in 0..threads {
+            for i in 0..per {
+                let key = c as u64 * per + i;
+                assert_eq!(t.get(k(key)), Some(key + 1), "key {key} lost");
+            }
+        }
+    }
+
     // ---- concurrency scaling microbench (run on demand) ------------------
     //
     // Measures how insert throughput scales with cores for this Masstree
@@ -1456,11 +1655,13 @@ mod tests {
         const TRIALS: usize = 25;
         let thread_counts = [1usize, 2, 4, 8];
 
-        fn cb_ins(t: &CbTree, key: [u8; 8], v: u64) {
+        fn cb_ins(t: &CbTree, _cpu: usize, key: [u8; 8], v: u64) {
             let _ = t.insert(key, v);
         }
-        fn mt_ins(t: &Masstree, key: [u8; 8], v: u64) {
-            let _ = t.put(key, v);
+        fn mt_ins(t: &Masstree, cpu: usize, key: [u8; 8], v: u64) {
+            // Each worker owns a unique cpu index, so it allocates from its
+            // private per-cpu pool -- no global alloc lock, the whole point.
+            let _ = t.put_on(cpu, key, v);
         }
 
         // Best (min) wall time over TRIALS for `threads` workers, each
@@ -1469,7 +1670,7 @@ mod tests {
         fn best<T: Send + Sync + 'static>(
             threads: usize,
             make: fn() -> T,
-            ins: fn(&T, [u8; 8], u64),
+            ins: fn(&T, usize, [u8; 8], u64),
         ) -> core::time::Duration {
             let mut best = core::time::Duration::MAX;
             for _ in 0..TRIALS {
@@ -1486,7 +1687,7 @@ mod tests {
                         }
                         let base = t as u64 * PER;
                         for i in 0..PER {
-                            ins(&tr, (base + i).to_be_bytes(), base + i + 1);
+                            ins(&tr, t, (base + i).to_be_bytes(), base + i + 1);
                         }
                     }));
                 }
