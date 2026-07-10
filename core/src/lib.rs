@@ -17,6 +17,7 @@ pub mod ebr;
 pub mod engine;
 pub mod kv;
 pub mod lba_alloc;
+pub mod nodeversion;
 pub mod silo;
 pub mod storage;
 pub mod sync;
