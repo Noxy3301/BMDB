@@ -1422,4 +1422,115 @@ mod tests {
             }
         });
     }
+
+    // ---- concurrency scaling microbench (run on demand) ------------------
+    //
+    // Measures how insert throughput scales with cores for this Masstree
+    // (fine-grained per-node locking) against the sequential-writer-locked
+    // cbptree. Both resolve reads lock-free; the difference is the write
+    // path, so the workload is concurrent insertion of DISJOINT new keys --
+    // exactly the case a single tree-wide writer lock serializes and
+    // per-node locking does not.
+    //
+    // Run with: cargo test -p bmdb-core --release masstree::tests::scaling
+    //           -- --ignored --nocapture
+    #[test]
+    #[ignore = "microbench; run explicitly with --ignored --nocapture"]
+    fn scaling_insert_throughput_masstree_vs_cbptree() {
+        use crate::cbptree::Tree as CbTree;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as SO};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // Fixed work PER THREAD: each worker inserts its own disjoint block
+        // of PER keys, so total work grows with the thread count and the
+        // timed wall clock stays flat only if the writers actually run in
+        // parallel. PER * max_threads stays inside cbptree's 256-node pool.
+        const PER: u64 = 150;
+        const TRIALS: usize = 25;
+        let thread_counts = [1usize, 2, 4, 8];
+
+        fn cb_ins(t: &CbTree, key: [u8; 8], v: u64) {
+            let _ = t.insert(key, v);
+        }
+        fn mt_ins(t: &Masstree, key: [u8; 8], v: u64) {
+            let _ = t.put(key, v);
+        }
+
+        // Best (min) wall time over TRIALS for `threads` workers, each
+        // inserting PER disjoint keys, released together by a spin barrier so
+        // thread-spawn cost is outside the timed region.
+        fn best<T: Send + Sync + 'static>(
+            threads: usize,
+            make: fn() -> T,
+            ins: fn(&T, [u8; 8], u64),
+        ) -> core::time::Duration {
+            let mut best = core::time::Duration::MAX;
+            for _ in 0..TRIALS {
+                let tree = Arc::new(make());
+                let ready = Arc::new(AtomicUsize::new(0));
+                let go = Arc::new(AtomicBool::new(false));
+                let mut handles = std::vec::Vec::new();
+                for t in 0..threads {
+                    let (tr, rd, gg) = (tree.clone(), ready.clone(), go.clone());
+                    handles.push(std::thread::spawn(move || {
+                        rd.fetch_add(1, SO::Release);
+                        while !gg.load(SO::Acquire) {
+                            core::hint::spin_loop();
+                        }
+                        let base = t as u64 * PER;
+                        for i in 0..PER {
+                            ins(&tr, (base + i).to_be_bytes(), base + i + 1);
+                        }
+                    }));
+                }
+                while ready.load(SO::Acquire) < threads {
+                    core::hint::spin_loop();
+                }
+                let start = Instant::now();
+                go.store(true, SO::Release);
+                for h in handles {
+                    h.join().unwrap();
+                }
+                let dt = start.elapsed();
+                if dt < best {
+                    best = dt;
+                }
+            }
+            best
+        }
+
+        std::eprintln!(
+            "\nconcurrent insert, {} disjoint keys PER thread (best of {} trials):",
+            PER, TRIALS
+        );
+        std::eprintln!(
+            "{:>7} | {:>16} {:>7} | {:>16} {:>7}",
+            "threads", "cbptree keys/s", "scaling", "masstree keys/s", "scaling"
+        );
+        let mut cb_base = 0.0f64;
+        let mut mt_base = 0.0f64;
+        for &n in &thread_counts {
+            let total = PER * n as u64;
+            let cb = best(n, CbTree::new, cb_ins);
+            let mt = best(n, Masstree::new, mt_ins);
+            let cb_rate = total as f64 / cb.as_secs_f64();
+            let mt_rate = total as f64 / mt.as_secs_f64();
+            if n == 1 {
+                cb_base = cb_rate;
+                mt_base = mt_rate;
+            }
+            std::eprintln!(
+                "{:>7} | {:>16.0} {:>6.2}x | {:>16.0} {:>6.2}x",
+                n,
+                cb_rate,
+                cb_rate / cb_base,
+                mt_rate,
+                mt_rate / mt_base
+            );
+        }
+        std::eprintln!(
+            "(cbptree serializes writers on one lock; masstree locks per node)\n"
+        );
+    }
 }
