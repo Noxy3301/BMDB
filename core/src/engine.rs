@@ -54,6 +54,8 @@
 //!
 //! [absent]: Tid::is_absent
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::bptree::{BpTree, Key};
 use crate::cbptree::Tree as CbTree;
 use crate::lba_alloc::WAL_START;
@@ -72,6 +74,12 @@ use crate::wal::{Op, Wal};
 /// this cap is hit; both limits surface as [`EngineError::OutOfSpace`].
 pub const ENGINE_RECORDS: usize = 512;
 
+/// Sentinel `cpu` for callers with no dedicated core (single-threaded use,
+/// recovery, the default `begin`/`transaction`). A concurrent index treats
+/// any value >= its CPU count as "the shared allocation path", so this both
+/// selects that path and never indexes a real per-cpu slot.
+pub const NO_CPU: usize = usize::MAX;
+
 /// Ordered key → record-slot map. Both methods take `&self`: a
 /// concurrent index (see [`CbTreeIndex`]) resolves lookups lock-free and
 /// serializes writers internally, so the engine keeps no lock on the read
@@ -80,9 +88,13 @@ pub const ENGINE_RECORDS: usize = 512;
 pub trait Index {
     /// Slot currently mapped to `key`, or `None` if unmapped.
     fn get(&self, key: Key) -> Option<u32>;
-    /// Map `key` to `slot`. Returns [`IndexFull`] if the index cannot
-    /// grow to hold another key.
-    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull>;
+    /// Bind `key` to `slot` if it is unmapped, else return the slot it is
+    /// already bound to -- an ATOMIC get-or-insert, so concurrent first-
+    /// touchers of the same key agree on one slot without a shared lock.
+    /// `cpu` is the caller's dedicated core index for per-cpu allocation
+    /// (or a value >= the index's CPU count for the shared path).
+    /// [`IndexFull`] if the index cannot grow to hold another key.
+    fn get_or_insert(&self, cpu: usize, key: Key, slot: u32) -> Result<u32, IndexFull>;
 }
 
 /// The index cannot accept another key.
@@ -116,11 +128,14 @@ impl Index for BpTreeIndex {
         self.tree.lock().lookup(key).map(|v| u64::from_be_bytes(v) as u32)
     }
 
-    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull> {
-        self.tree
-            .lock()
-            .upsert(key, (slot as u64).to_be_bytes())
-            .map(|_| ())
+    fn get_or_insert(&self, _cpu: usize, key: Key, slot: u32) -> Result<u32, IndexFull> {
+        // The lock spans get + insert, so the get-or-insert is atomic.
+        let mut tree = self.tree.lock();
+        if let Some(v) = tree.lookup(key) {
+            return Ok(u64::from_be_bytes(v) as u32);
+        }
+        tree.upsert(key, (slot as u64).to_be_bytes())
+            .map(|_| slot)
             .map_err(|_| IndexFull)
     }
 }
@@ -150,10 +165,10 @@ impl Index for CbTreeIndex {
         self.tree.lookup(&key).map(|v| v as u32)
     }
 
-    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull> {
+    fn get_or_insert(&self, _cpu: usize, key: Key, slot: u32) -> Result<u32, IndexFull> {
         self.tree
-            .insert(key, slot as u64)
-            .map(|_| ())
+            .get_or_insert(key, slot as u64)
+            .map(|v| v as u32)
             .map_err(|_| IndexFull)
     }
 }
@@ -184,10 +199,10 @@ impl Index for MasstreeIndex {
         self.tree.get(key).map(|v| v as u32)
     }
 
-    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull> {
+    fn get_or_insert(&self, cpu: usize, key: Key, slot: u32) -> Result<u32, IndexFull> {
         self.tree
-            .put(key, slot as u64)
-            .map(|_| ())
+            .get_or_put_on(cpu, key, slot as u64)
+            .map(|v| v as u32)
             .map_err(|_| IndexFull)
     }
 }
@@ -209,10 +224,11 @@ pub struct Engine<I: Index = BpTreeIndex> {
     /// Key → slot map. Read off the hot path with no engine lock; the
     /// concurrent index makes lookups lock-free.
     index: I,
-    /// Next unused record slot. Guarded so the find-or-allocate for a
-    /// brand-new key is atomic across concurrent transactions; existing
-    /// keys never touch this lock (they resolve through `index` alone).
-    next_slot: SpinLock<u32>,
+    /// Next unused record slot. A brand-new key claims one with a saturating
+    /// atomic bump, then binds it through the index's atomic get-or-insert --
+    /// no lock, so first-touches of disjoint keys never serialize. Existing
+    /// keys never touch this at all (they resolve through `index` alone).
+    next_slot: AtomicU32,
     /// Write-ahead log cursor for durable commits. Guarded so concurrent
     /// durable commits serialize their append + flush.
     wal: SpinLock<Wal>,
@@ -231,7 +247,7 @@ impl Engine<BpTreeIndex> {
         Self {
             records: EMPTY_RECORDS,
             index: BpTreeIndex::new(),
-            next_slot: SpinLock::new(0),
+            next_slot: AtomicU32::new(0),
             wal: SpinLock::new(Wal::new()),
         }
     }
@@ -243,7 +259,7 @@ impl Engine<CbTreeIndex> {
         Self {
             records: EMPTY_RECORDS,
             index: CbTreeIndex::new(),
-            next_slot: SpinLock::new(0),
+            next_slot: AtomicU32::new(0),
             wal: SpinLock::new(Wal::new()),
         }
     }
@@ -256,7 +272,7 @@ impl Engine<MasstreeIndex> {
         Self {
             records: EMPTY_RECORDS,
             index: MasstreeIndex::new(),
-            next_slot: SpinLock::new(0),
+            next_slot: AtomicU32::new(0),
             wal: SpinLock::new(Wal::new()),
         }
     }
@@ -269,11 +285,21 @@ impl Default for Engine<BpTreeIndex> {
 }
 
 impl<I: Index> Engine<I> {
-    /// Begin a transaction stamped with the current epoch.
+    /// Begin a transaction stamped with the current epoch, with no dedicated
+    /// core (the index allocates new-key slots from its shared path).
     pub fn begin(&self) -> Txn<'_, I> {
+        self.begin_on(NO_CPU)
+    }
+
+    /// Begin a transaction whose new-key slot allocations route to `cpu`'s
+    /// private index pool. `cpu` must be unique to the calling thread (or
+    /// [`NO_CPU`]) for the duration -- the same contract the concurrent index
+    /// requires of a per-cpu index.
+    pub fn begin_on(&self, cpu: usize) -> Txn<'_, I> {
         Txn {
             engine: self,
             state: TxnState::new(current_epoch()),
+            cpu,
         }
     }
 
@@ -281,12 +307,21 @@ impl<I: Index> Engine<I> {
     /// `max_attempts` times. Returns the body's value on commit, or
     /// `None` if every attempt aborted or the body returned an error
     /// (a full set / out-of-space is terminal, not retried).
-    pub fn transaction<F, R>(&self, max_attempts: u32, mut body: F) -> Option<R>
+    pub fn transaction<F, R>(&self, max_attempts: u32, body: F) -> Option<R>
+    where
+        F: FnMut(&mut Txn<'_, I>) -> Result<R, EngineError>,
+    {
+        self.transaction_on(NO_CPU, max_attempts, body)
+    }
+
+    /// [`transaction`](Self::transaction) with new-key slot allocation routed
+    /// to `cpu`'s private index pool (see [`begin_on`](Self::begin_on)).
+    pub fn transaction_on<F, R>(&self, cpu: usize, max_attempts: u32, mut body: F) -> Option<R>
     where
         F: FnMut(&mut Txn<'_, I>) -> Result<R, EngineError>,
     {
         for _ in 0..max_attempts {
-            let mut txn = self.begin();
+            let mut txn = self.begin_on(cpu);
             let value = match body(&mut txn) {
                 Ok(v) => v,
                 Err(_) => return None,
@@ -407,7 +442,7 @@ impl<I: Index> Engine<I> {
     /// bypassing the OCC protocol. Later groups overwrite earlier ones
     /// for the same key (last committed wins).
     fn recover_apply(&self, key: Key, value: u64, absent: bool, tid: Tid) {
-        let Some(slot) = self.slot_for(key) else {
+        let Some(slot) = self.slot_for(NO_CPU, key) else {
             return; // recovered working set exceeds the pool; drop the tail
         };
         let record = self.record(slot);
@@ -424,25 +459,29 @@ impl<I: Index> Engine<I> {
     /// Slot for `key`, allocating a fresh record if the key is new.
     ///
     /// The common case — a key already in the index — resolves lock-free
-    /// through `index.get` with no engine lock held. Only a brand-new key
-    /// takes `next_slot`, and re-checks the index under it (a racing
-    /// allocator may have bound the key between our miss and the lock), so
-    /// a key is never assigned two slots.
-    fn slot_for(&self, key: Key) -> Option<u32> {
+    /// through `index.get` with no engine lock held. A brand-new key claims a
+    /// tentative slot with a saturating atomic bump (never past
+    /// `ENGINE_RECORDS`, so it can't wrap and reissue a live slot), then binds
+    /// it through the index's ATOMIC get-or-insert: if another thread bound
+    /// the key first, get-or-insert returns that slot and our tentative one is
+    /// simply left unused (a fresh, absent record). So a key is never assigned
+    /// two slots, and disjoint-key first-touches never serialize on a lock.
+    /// `cpu` routes the index's node allocation to that core's private pool.
+    fn slot_for(&self, cpu: usize, key: Key) -> Option<u32> {
         if let Some(slot) = self.index.get(key) {
             return Some(slot);
         }
-        let mut next = self.next_slot.lock();
-        if let Some(slot) = self.index.get(key) {
-            return Some(slot);
-        }
-        let slot = *next;
-        if slot as usize >= ENGINE_RECORDS {
-            return None;
-        }
-        self.index.insert(key, slot).ok()?;
-        *next = slot + 1;
-        Some(slot)
+        let tentative = self
+            .next_slot
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n as usize >= ENGINE_RECORDS {
+                    None
+                } else {
+                    Some(n + 1)
+                }
+            })
+            .ok()?;
+        self.index.get_or_insert(cpu, key, tentative).ok()
     }
 
     fn record(&self, slot: u32) -> &Record {
@@ -456,6 +495,8 @@ impl<I: Index> Engine<I> {
 pub struct Txn<'e, I: Index> {
     engine: &'e Engine<I>,
     state: TxnState,
+    /// Dedicated core for new-key slot allocation, or [`NO_CPU`].
+    cpu: usize,
 }
 
 impl<'e, I: Index> Txn<'e, I> {
@@ -479,7 +520,7 @@ impl<'e, I: Index> Txn<'e, I> {
         // Allocate a stable slot even for an absent key so this read can
         // be validated: without a record, a later insert of `key` would
         // be an undetectable phantom.
-        let slot = self.engine.slot_for(key).ok_or(EngineError::OutOfSpace)?;
+        let slot = self.engine.slot_for(self.cpu, key).ok_or(EngineError::OutOfSpace)?;
         let record = self.engine.record(slot);
         // A clean snapshot is preferred; under a racing writer fall back
         // to a forced load, which seeds the read set with the (possibly
@@ -499,7 +540,7 @@ impl<'e, I: Index> Txn<'e, I> {
     ///
     /// [`commit`]: Txn::commit
     pub fn put(&mut self, key: Key, value: u64) -> Result<(), EngineError> {
-        let slot = self.engine.slot_for(key).ok_or(EngineError::OutOfSpace)?;
+        let slot = self.engine.slot_for(self.cpu, key).ok_or(EngineError::OutOfSpace)?;
         let record = self.engine.record(slot);
         self.state
             .add_write(record, key, value)
@@ -512,7 +553,7 @@ impl<'e, I: Index> Txn<'e, I> {
     /// Deleting an absent key is a no-op that still advances the record's
     /// version.
     pub fn delete(&mut self, key: Key) -> Result<(), EngineError> {
-        let slot = self.engine.slot_for(key).ok_or(EngineError::OutOfSpace)?;
+        let slot = self.engine.slot_for(self.cpu, key).ok_or(EngineError::OutOfSpace)?;
         let record = self.engine.record(slot);
         self.state
             .add_delete(record, key)
@@ -1008,7 +1049,10 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for i in 0..PER {
                     let key = t * PER + i;
-                    let committed = e.transaction(8, |txn| {
+                    // transaction_on(t): this thread's new keys allocate from
+                    // cpu t's private index pool via the lock-free slot bump --
+                    // the #6 path, exercised concurrently.
+                    let committed = e.transaction_on(t as usize, 8, |txn| {
                         txn.put(k(key), key + 1)?;
                         Ok(())
                     });

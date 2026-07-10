@@ -521,6 +521,21 @@ impl Tree {
         r
     }
 
+    /// Get-or-insert: return `key`'s existing value if present, otherwise
+    /// insert `value` and return it. Atomic under the single writer lock, so
+    /// concurrent callers racing to bind the same key agree on one value.
+    pub fn get_or_insert(&self, key: Key, value: Value) -> Result<Value, InsertError> {
+        self.writer_lock();
+        // We hold the sole writer lock, so a lock-free lookup is stable.
+        let r = if let Some(existing) = self.lookup(&key) {
+            Ok(existing)
+        } else {
+            self.insert_locked(&key, value).map(|_| value)
+        };
+        self.writer_unlock();
+        r
+    }
+
     fn insert_locked(&self, key: &Key, value: Value) -> Result<Inserted, InsertError> {
         // Ensure a root leaf exists (we hold the writer lock, so no race).
         let mut root = self.root.load(Ordering::Acquire);

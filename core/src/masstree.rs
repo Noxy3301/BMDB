@@ -799,23 +799,52 @@ impl Masstree {
     /// hands the value cell to its caller; row-level concurrency control is
     /// out of tree scope there and here).
     pub fn put_on(&self, cpu: usize, key: [u8; 8], value: u64) -> Result<Inserted, InsertError> {
+        self.put_inner(cpu, key, value, true).map(|(ins, _)| ins)
+    }
+
+    /// Get-or-insert: if `key` is present, return its EXISTING value without
+    /// overwriting; otherwise insert `value` and return it. This is the
+    /// primitive the engine's slot allocator needs -- a key must keep its
+    /// first-assigned record slot even if two threads race to bind it. `cpu`
+    /// contract as [`put_on`](Self::put_on).
+    pub fn get_or_put_on(&self, cpu: usize, key: [u8; 8], value: u64) -> Result<u64, InsertError> {
+        self.put_inner(cpu, key, value, false).map(|(_, v)| v)
+    }
+
+    /// Shared body of put_on/get_or_put_on. Returns `(outcome, mapped_value)`:
+    /// on an existing key, `overwrite` decides whether the slot takes `value`
+    /// (put) or keeps its current value (get-or-insert); either way the
+    /// returned value is what the key now maps to.
+    fn put_inner(
+        &self,
+        cpu: usize,
+        key: [u8; 8],
+        value: u64,
+        overwrite: bool,
+    ) -> Result<(Inserted, u64), InsertError> {
         let ika = u64::from_be_bytes(key);
         let root = self.fix_root(self.ensure_root(cpu)?);
         let (n, kx) = self.find_locked(root, ika);
         let node = self.node(n);
 
         if kx.p >= 0 {
-            // Publish the new value through the version protocol. The
-            // reference treats value concurrency as outside the tree (it hands
-            // the caller the value cell), but here the value IS the tree's
-            // payload, so an update must bump the version: mark_insert() forces
-            // an in-flight reader to retry and its release on unlock() pairs
-            // with a later reader's stable() acquire, so no one reads a stale
-            // value behind a clean version word.
-            node.version.mark_insert();
-            node.lv[kx.p as usize].store(value, Ordering::Relaxed);
+            if overwrite {
+                // Publish the new value through the version protocol. The
+                // reference treats value concurrency as outside the tree (it
+                // hands the caller the value cell), but here the value IS the
+                // tree's payload, so an update must bump the version:
+                // mark_insert() forces an in-flight reader to retry and its
+                // release on unlock() pairs with a later reader's stable()
+                // acquire, so no one reads a stale value behind a clean word.
+                node.version.mark_insert();
+                node.lv[kx.p as usize].store(value, Ordering::Relaxed);
+                node.version.unlock();
+                return Ok((Inserted::Updated, value));
+            }
+            // Get-or-insert: leave the value untouched, return the existing one.
+            let existing = node.lv[kx.p as usize].load(Ordering::Relaxed);
             node.version.unlock();
-            return Ok(Inserted::Updated);
+            return Ok((Inserted::Updated, existing));
         }
 
         // find_insert: try the leaf's free slots first. (modstate_ dance
@@ -831,12 +860,12 @@ impl Masstree {
                 node.assign(kxp, ika, value);
                 self.finish_insert(n, kx.i, kxp);
                 node.version.unlock();
-                return Ok(Inserted::New);
+                return Ok((Inserted::New, value));
             }
         }
 
         self.make_split(cpu, n, kx.i, ika, value)?;
-        Ok(Inserted::New)
+        Ok((Inserted::New, value))
     }
 
     /// leaf::split_into: move the upper half of nl into the fresh locked
