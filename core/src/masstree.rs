@@ -89,6 +89,12 @@ pub enum InsertError {
 /// waste buy a single uniform struct). Every field a concurrent reader can
 /// touch is atomic -- a plain shared field would be UB in Rust regardless
 /// of the version protocol (same rule nodeversion.rs documents).
+///
+/// `align(64)` so no two nodes share a cache line: without it, two cores
+/// splitting adjacent-in-pool leaves would false-share each other's version
+/// word and bounce the line even though the nodes are logically disjoint
+/// (cbptree already aligns its node for the same reason).
+#[repr(C, align(64))]
 struct Node {
     version: NodeVersion,
     /// Leaf only: the kpermuter word ordering the 15 slots.

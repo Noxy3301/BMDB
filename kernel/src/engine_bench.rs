@@ -48,6 +48,10 @@ static ENGINE: Engine<CbTreeIndex> = Engine::concurrent();
 /// Per-worker outcome counters. Single producer per slot (the worker
 /// whose `cpu_index` owns the row), so `Relaxed` RMW is enough; the BSP
 /// reads with `Acquire` after the worker publishes `WORKERS_ONLINE`.
+///
+/// `align(64)` so each worker's counters own their cache line(s) and
+/// adjacent workers do not false-share their per-transaction `fetch_add`s.
+#[repr(C, align(64))]
 struct WorkerStats {
     commits: AtomicU64,
     aborts_lock: AtomicU64,

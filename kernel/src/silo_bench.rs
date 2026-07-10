@@ -73,6 +73,12 @@ static WORKERS: [WorkerSlot; MAX_CPUS] = {
 /// whose `cpu_index` owns the row), so `Relaxed` RMW is enough.
 /// Aggregation on the BSP reads with `Acquire` after the worker has
 /// published `WORKERS_ONLINE`.
+///
+/// `align(64)` so each worker's counters own their cache line(s): without
+/// it, adjacent workers' `commits`/`*_cycles` `fetch_add` invalidate each
+/// other every transaction, manufacturing false-sharing contention that has
+/// nothing to do with the workload under test.
+#[repr(C, align(64))]
 struct WorkerStats {
     commits: AtomicU64,
     aborts_lock: AtomicU64,
