@@ -57,6 +57,7 @@
 use crate::bptree::{BpTree, Key};
 use crate::cbptree::Tree as CbTree;
 use crate::lba_alloc::WAL_START;
+use crate::masstree::Masstree;
 use crate::silo::{
     self, CommitOutcome, MAX_RW_SET, Record, Tid, TxnState, current_epoch, ensure_epoch_at_least,
     mark_durable,
@@ -157,6 +158,40 @@ impl Index for CbTreeIndex {
     }
 }
 
+/// [`Index`] backed by the faithful concurrent Masstree. Like
+/// [`CbTreeIndex`] its lookups take no engine lock, but writers lock only
+/// the nodes they touch instead of a single tree-wide writer lock, so
+/// inserts of disjoint keys proceed in parallel. The 8-byte value slot
+/// carries the record index directly as a `u64`.
+pub struct MasstreeIndex {
+    tree: Masstree,
+}
+
+impl MasstreeIndex {
+    pub const fn new() -> Self {
+        Self { tree: Masstree::new() }
+    }
+}
+
+impl Default for MasstreeIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Index for MasstreeIndex {
+    fn get(&self, key: Key) -> Option<u32> {
+        self.tree.get(key).map(|v| v as u32)
+    }
+
+    fn insert(&self, key: Key, slot: u32) -> Result<(), IndexFull> {
+        self.tree
+            .put(key, slot as u64)
+            .map(|_| ())
+            .map_err(|_| IndexFull)
+    }
+}
+
 /// Reason a transaction operation could not proceed. Distinct from a
 /// commit *abort* (see [`CommitOutcome`]): these are terminal for the
 /// attempt and are not retried by [`Engine::transaction`].
@@ -208,6 +243,19 @@ impl Engine<CbTreeIndex> {
         Self {
             records: EMPTY_RECORDS,
             index: CbTreeIndex::new(),
+            next_slot: SpinLock::new(0),
+            wal: SpinLock::new(Wal::new()),
+        }
+    }
+}
+
+impl Engine<MasstreeIndex> {
+    /// Construct an empty engine on the fine-grained-locking Masstree index,
+    /// where inserts of disjoint keys do not serialize on one writer lock.
+    pub const fn masstree() -> Self {
+        Self {
+            records: EMPTY_RECORDS,
+            index: MasstreeIndex::new(),
             next_slot: SpinLock::new(0),
             wal: SpinLock::new(Wal::new()),
         }
@@ -937,6 +985,43 @@ mod tests {
         for key in 0..(THREADS * PER) {
             let got = engine.transaction(8, |txn| txn.get(k(key))).unwrap();
             assert_eq!(got, Some(key + 1), "key {key} lost or wrong after concurrent load");
+        }
+    }
+
+    #[test]
+    fn masstree_index_lands_every_disjoint_key() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Same disjoint-key concurrent load, but on the fine-grained Masstree
+        // index: threads inserting brand-new keys into different subtrees lock
+        // only the nodes they touch, so this also exercises concurrent
+        // first-touch allocation + tree inserts that do NOT serialize on one
+        // writer lock. Every put must still commit and read back exactly.
+        const THREADS: u64 = 4;
+        const PER: u64 = 64;
+
+        let engine = Arc::new(Engine::masstree());
+        let mut handles = std::vec::Vec::new();
+        for t in 0..THREADS {
+            let e = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for i in 0..PER {
+                    let key = t * PER + i;
+                    let committed = e.transaction(8, |txn| {
+                        txn.put(k(key), key + 1)?;
+                        Ok(())
+                    });
+                    assert_eq!(committed, Some(()), "disjoint put must commit");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        for key in 0..(THREADS * PER) {
+            let got = engine.transaction(8, |txn| txn.get(k(key))).unwrap();
+            assert_eq!(got, Some(key + 1), "key {key} lost or wrong on masstree index");
         }
     }
 
