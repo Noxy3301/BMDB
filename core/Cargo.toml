@@ -7,3 +7,9 @@ edition.workspace = true
 bench = false
 
 [dependencies]
+
+# Host-only, test-only: thread pinning for the scaling microbench so a
+# scaling measurement is not corrupted by the dev box's scheduler migrating
+# workers across NUMA sockets. Does NOT affect the no_std production build.
+[dev-dependencies]
+libc = "0.2"

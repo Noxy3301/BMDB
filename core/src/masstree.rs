@@ -1667,9 +1667,23 @@ mod tests {
         // of PER keys, so total work grows with the thread count and the
         // timed wall clock stays flat only if the writers actually run in
         // parallel. PER * max_threads stays inside cbptree's 256-node pool.
-        const PER: u64 = 150;
+        const PER: u64 = 200;
         const TRIALS: usize = 25;
         let thread_counts = [1usize, 2, 4, 8];
+
+        // Pin worker `cpu` to a distinct physical core of socket 0 (logical
+        // CPUs 0..16 on this box, one per physical core, same NUMA node). This
+        // dev box is a busy 2-socket NUMA machine; without pinning the
+        // scheduler migrates workers across sockets and the measurement
+        // reports migration/coherence noise rather than the tree's scaling.
+        fn pin_to_core(cpu: usize) {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let mut set: libc::cpu_set_t = core::mem::zeroed();
+                libc::CPU_SET(cpu, &mut set);
+                libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
+        }
 
         fn cb_ins(t: &CbTree, _cpu: usize, key: [u8; 8], v: u64) {
             let _ = t.insert(key, v);
@@ -1697,6 +1711,7 @@ mod tests {
                 for t in 0..threads {
                     let (tr, rd, gg) = (tree.clone(), ready.clone(), go.clone());
                     handles.push(std::thread::spawn(move || {
+                        pin_to_core(t);
                         rd.fetch_add(1, SO::Release);
                         while !gg.load(SO::Acquire) {
                             core::hint::spin_loop();
