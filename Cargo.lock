@@ -50,6 +50,9 @@ dependencies = [
 [[package]]
 name = "bmdb-core"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "bmdb-kernel"

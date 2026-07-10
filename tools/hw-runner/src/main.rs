@@ -214,8 +214,12 @@ fn run_qemu(opts: &Opts, artifacts: &Artifacts) -> Result<()> {
     // paths — keep it on by default. Requires `/dev/kvm` access; if
     // `Could not access KVM kernel module: Permission denied` fires,
     // `sudo usermod -aG kvm $USER` then log out and back in.
-    cmd.args(["-serial", "stdio", "-display", "none", "-smp", "4"]);
-    cmd.args(["-enable-kvm", "-cpu", "host"]);
+    // -smp from BMDB_SMP (default 4) so a scaling sweep can vary the vCPU
+    // count without a rebuild; +invtsc exposes an invariant TSC (and the KVM
+    // TSC-frequency leaf) so the guest can convert cycles to seconds under KVM.
+    let smp = std::env::var("BMDB_SMP").unwrap_or_else(|_| "4".to_string());
+    cmd.args(["-serial", "stdio", "-display", "none", "-smp", &smp]);
+    cmd.args(["-enable-kvm", "-cpu", "host,+invtsc"]);
     cmd.arg("-drive")
         .arg(format!("file={},format=raw,if=none,id=nvme0", disk.display()));
     cmd.args(["-device", "nvme,serial=BMDB0001,drive=nvme0"]);

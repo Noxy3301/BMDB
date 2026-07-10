@@ -188,6 +188,22 @@ pub fn run(_nvme: &mut bmdb_nvme::Controller, expected_workers: u32) {
     let my_cpu = unsafe { crate::percpu::current().cpu_index } as usize;
 
     let hz = timing::tsc_hz();
+    let d = timing::cpuid_diag();
+    serial_println!(
+        "YCSB-BENCH cpuid: hypervisor={} hv_max=0x{:08x} hv_sig={:08x},{:08x},{:08x} \
+         hv_tsc_khz={} invariant_tsc={} leaf15={:x},{:x},{:x} leaf16_mhz={}",
+        d.hypervisor,
+        d.hv_max_leaf,
+        d.hv_sig[0],
+        d.hv_sig[1],
+        d.hv_sig[2],
+        d.hv_tsc_khz,
+        d.invariant_tsc,
+        d.leaf15[0],
+        d.leaf15[1],
+        d.leaf15[2],
+        d.leaf16_mhz,
+    );
     serial_println!(
         "YCSB-BENCH invariant_tsc={} tsc_hz={} keys={} window_cycles={}",
         timing::has_invariant_tsc(),
